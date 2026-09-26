@@ -7576,6 +7576,35 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("staging platform exported-app launcher failed")?;
+        // And the Worker adapter. Consumed only when the selected app is a
+        // Cloudflare Worker (wrangler config + exported `fetch` handler) — its
+        // own `scripts.start` runs the `wrangler` CLI, which our Node substrate
+        // cannot launch. Staged here for the same reason as the launcher above:
+        // the build session is still open now and is closed by the time the
+        // start command is resolved.
+        let worker_script = r#"set -eu
+p=.hive-worker-launcher.mjs
+[ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: worker launcher path may not be a symlink' >&2; exit 41; }
+tmp=$(mktemp .hive-worker-launcher.XXXXXX)
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+printf '%s' "$1" >"$tmp"
+chmod 0444 "$tmp"
+mv -f -- "$tmp" "$p"
+trap - EXIT HUP INT TERM
+"#;
+        require_build_session(&mut isolated)?
+            .run(
+                dir,
+                worker_script,
+                "stage platform worker launcher",
+                &[WORKER_LAUNCHER_JS.to_string()],
+                false,
+                cloud,
+                bid,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .context("staging platform worker launcher failed")?;
     }
     // Runtime dependency normalization for nested pnpm workspaces, auto-planned
     // lane only: repository-controlled install/build overrides own their output
@@ -7847,6 +7876,27 @@ done' hive-delink {} +
                     }
                 }
             }
+            // CLOUDFLARE WORKER LANE. A Worker app's own start command runs the
+            // `wrangler` CLI, which needs workerd and an account and which our
+            // Node substrate refuses outright. When the shape is recognised,
+            // host the handler it exports through the platform's Worker adapter
+            // instead of trying to launch wrangler. The adapter was staged into
+            // this directory above; see `assets/worker-launcher.mjs` for what it
+            // does and does not emulate.
+            if let Some(entry) = discover_worker_entry(dir) {
+                let mut cmd = vec!["node".to_string()];
+                if entry.ends_with(".ts") || entry.ends_with(".mts") {
+                    cmd.push("--experimental-strip-types".to_string());
+                }
+                cmd.push(WORKER_LAUNCHER_FILE.to_string());
+                cmd.push(entry.clone());
+                log(format!(
+                    "Cloudflare Worker detected — hosting its exported `fetch` handler via the \
+                     platform worker adapter (entry `{entry}`) instead of the `wrangler` CLI, \
+                     which needs the Workers runtime and an account."
+                ));
+                start = cmd;
+            }
             log(format!(
                 "Provisioning serverless server: `{}`.",
                 start.join(" ")
@@ -7916,6 +7966,55 @@ const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
 /// fallback in `build_via_fdi`.
 const EXPRESS_LAUNCHER_JS: &str = include_str!("../assets/express-launcher.mjs");
 const EXPRESS_LAUNCHER_FILE: &str = ".hive-express-launcher.mjs";
+const WORKER_LAUNCHER_JS: &str = include_str!("../assets/worker-launcher.mjs");
+const WORKER_LAUNCHER_FILE: &str = ".hive-worker-launcher.mjs";
+
+/// Recognise a Cloudflare Worker application: a wrangler config plus an entry
+/// module whose default export is (or owns) a `fetch` handler.
+///
+/// These repos cannot be started the way their own template starts them — every
+/// `scripts.start` runs the `wrangler` CLI, which needs the Workers runtime
+/// (workerd) and a Cloudflare account, and our Node substrate refuses that
+/// ("command wrangler is not a dir"). Recognising the shape lets us host the
+/// SAME exported handler on Node instead (see `assets/worker-launcher.mjs`).
+fn discover_worker_entry(dir: &Path) -> Option<String> {
+    let configured = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
+        .iter()
+        .find(|name| dir.join(name).is_file())
+        .and_then(|name| {
+            let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+            // `main` names the Worker entry. The JSON flavour can carry comments
+            // (jsonc), so scan for the key rather than parsing strictly; a
+            // missing/unreadable value just falls through to the conventional
+            // stems below.
+            for line in raw.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("main") else {
+                    continue;
+                };
+                let rest = rest.trim().trim_start_matches('=').trim();
+                let value = rest.trim_matches(',').trim().trim_matches('"').trim();
+                if !value.is_empty() && !value.contains("..") {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        });
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(main) = configured {
+        candidates.push(main);
+    }
+    for prefix in ["src/", ""] {
+        for stem in ["index", "worker", "main"] {
+            for ext in [".ts", ".mts", ".js", ".mjs"] {
+                candidates.push(format!("{prefix}{stem}{ext}"));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|rel| !rel.contains("..") && !rel.starts_with('/') && dir.join(rel).is_file())
+}
 
 /// Find an entry module that plausibly exports the app's server, for the
 /// no-start-script launcher lane. `package.json` `main`/`module` win, then the
