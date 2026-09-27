@@ -27,6 +27,8 @@ use std::str::FromStr;
 pub struct ComposeBuild {
     pub context: String,
     pub dockerfile: Option<String>,
+    /// Build stage to stop at (`target:`). None = build the Dockerfile's final stage.
+    pub target: Option<String>,
 }
 
 /// Explicit opt-in for routing a NON-PRIMARY service externally, read from an
@@ -279,6 +281,7 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
         Some(serde_yaml::Value::String(s)) => Some(ComposeBuild {
             context: s.clone(),
             dockerfile: None,
+            target: None,
         }),
         Some(serde_yaml::Value::Mapping(_)) => {
             let context = v?
@@ -290,9 +293,17 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
                 .get("dockerfile")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
+            // `target:` names the build stage to stop at. Dropping it silently
+            // built the Dockerfile's LAST stage instead of the one the compose
+            // file asked for; in docker/awesome-compose/apache-php that is the
+            // difference between the `builder` stage the service declares and
+            // the heavyweight `dev-envs` stage that happens to be last.
+
+            let target = v?.get("target").and_then(|c| c.as_str()).map(|s| s.to_string());
             Some(ComposeBuild {
                 context,
                 dockerfile,
+                target,
             })
         }
         _ => None,

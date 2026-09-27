@@ -6613,10 +6613,23 @@ async fn produce_manifest(
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
     // full topology). Single-Dockerfile projects are unaffected.
     let compose_path = crate::compose::compose_file(dir);
-    if compose_path.is_some() {
-        anyhow::bail!(
-            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Compose source builds; no repository command was run on the host"
-        );
+    if let Some(compose_path) = compose_path {
+        return compose_container_manifest(
+            cloud,
+            bid,
+            isolated,
+            dir,
+            &compose_path,
+            project,
+            incarnation,
+            image_port,
+            image_protocol,
+            image_memory,
+            image_cpus,
+            image_pids,
+            image_ports,
+        )
+        .await;
     }
     let dockerfile = container_build_file(dir);
     if let Some(dockerfile) = dockerfile {
@@ -10304,6 +10317,162 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
+/// Build a `docker-compose`/`compose.yaml` repo into a container manifest.
+///
+/// Same reasoning as `dockerfile_container_manifest`: builder protocol v1 only
+/// accepts `BuildSurface::RepositoryCommands`, and `podman build` / `podman
+/// compose` need a container runtime, not a syscall sandbox — so this runs on the
+/// host, like every other container deployment. It used to be a hard refusal
+/// ("builder protocol v1 rejects Compose source builds"), which failed every
+/// compose repo even though `compose::parse_compose` and
+/// `compose::primary_service` already existed and were used elsewhere for routing.
+///
+/// Only the PRIMARY service becomes the deployment's routable function: compose
+/// expresses a whole topology, and this platform's unit of deployment is one
+/// project namespace with one public entrypoint. The primary service is built
+/// from source when it declares `build:`, and pulled from a registry when it
+/// declares `image:` — `build` wins when both are present, matching compose's own
+/// precedence.
+async fn compose_container_manifest(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    isolated: Option<&mut IsolatedBuild>,
+    dir: &Path,
+    compose_path: &Path,
+    project: &str,
+    incarnation: ProjectIncarnation,
+    image_port: Option<u16>,
+    image_protocol: Option<ServiceProtocol>,
+    image_memory: Option<&str>,
+    image_cpus: Option<&str>,
+    image_pids: u32,
+    image_ports: Option<Vec<PortSpec>>,
+) -> anyhow::Result<Manifest> {
+    if let Some(session) = isolated {
+        session.finish().await?;
+    }
+    let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
+    let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
+    let log = |s: String| cloud.builds.log(bid, s);
+    let text = tokio::fs::read_to_string(compose_path).await.map_err(|error| {
+        anyhow::anyhow!("cannot read {}: {error}", compose_path.display())
+    })?;
+    let services = crate::compose::parse_compose(&text)?;
+    anyhow::ensure!(
+        !services.is_empty(),
+        "{} declares no services — nothing to deploy",
+        compose_path.display()
+    );
+    let primary = crate::compose::primary_service(&services)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{} declares no primary service", compose_path.display()))?;
+    log(format!(
+        "Detected compose file {} — {} service(s), primary `{}`.",
+        compose_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "compose".to_string()),
+        services.len(),
+        primary.name
+    ));
+    let port = image_port.or(Some(primary.port));
+    let protocol = image_protocol.or(Some(primary.protocol));
+
+    let (image, skip_pull) = match &primary.build {
+        Some(build) => {
+            let context = dir.join(&build.context);
+            let dockerfile = context.join(
+                build
+                    .dockerfile
+                    .clone()
+                    .unwrap_or_else(|| "Dockerfile".to_string()),
+            );
+            anyhow::ensure!(
+                dockerfile.is_file(),
+                "compose service `{}` builds from {} but that file does not exist",
+                primary.name,
+                dockerfile.display()
+            );
+            let tag = format!("hive-{}-{project}:latest", sanitize_tag(project));
+            let podman_path = podman_path_env();
+            log(format!(
+                "Building image for compose service `{}` from {}{} …",
+                primary.name,
+                dockerfile.display(),
+                build
+                    .target
+                    .as_deref()
+                    .map(|t| format!(" (stage `{t}`)"))
+                    .unwrap_or_default()
+            ));
+            let t0 = now_ms();
+            let mut args = vec![
+                "build".to_string(),
+                // `--layers` is what enables BuildKit-style cache mounts
+                // (`RUN --mount=type=cache,...`); without it podman fails on
+                // those steps outright, which is every docker/awesome-compose
+                // image (flask, django, …).
+                "--layers".to_string(),
+                "-t".to_string(),
+                tag.clone(),
+                "-f".to_string(),
+                dockerfile.to_string_lossy().to_string(),
+            ];
+            // Honour `build.target:` — stopping at the declared stage is what
+            // real `docker compose` does; without it podman builds the last
+            // stage, which is a different image than the compose file described.
+            if let Some(target) = build.target.as_deref() {
+                args.push("--target".to_string());
+                args.push(target.to_string());
+            }
+            args.push(context.to_string_lossy().to_string());
+            let out = Command::new("podman")
+                .args(&args)
+                .env("PATH", &podman_path)
+                .output()
+                .await?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let msg = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("build failed");
+                anyhow::bail!("podman build failed: {}", msg.trim());
+            }
+            log(format!(
+                "Built image {tag} in {}ms",
+                now_ms().saturating_sub(t0)
+            ));
+            (tag, true)
+        }
+        None => match &primary.image {
+            Some(image) => (image.clone(), false),
+            None => anyhow::bail!(
+                "compose service `{}` declares neither `build:` nor `image:` — there is \
+                 nothing to run",
+                primary.name
+            ),
+        },
+    };
+
+    image_container_manifest(
+        cloud,
+        bid,
+        project,
+        incarnation,
+        &image,
+        port,
+        protocol,
+        mem_mib,
+        cpus,
+        image_pids,
+        image_ports,
+        skip_pull,
+    )
+    .await
+}
+
 /// Build a `Dockerfile`/`Containerfile` repo into a container manifest.
 ///
 /// WHY THIS IS NOT THE ISOLATED BUILDER. `BuildSurface::RepositoryCommands` is
@@ -10366,6 +10535,11 @@ async fn dockerfile_container_manifest(
     let out = Command::new("podman")
         .args([
             "build",
+            // `--layers` enables BuildKit-style cache mounts
+            // (`RUN --mount=type=cache,...`); without it those steps fail
+            // outright, which is most real Dockerfiles (see the compose lane's
+            // note — docker/awesome-compose/flask is one).
+            "--layers",
             "-t",
             &tag,
             "-f",
