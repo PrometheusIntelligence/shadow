@@ -6598,6 +6598,8 @@ async fn produce_manifest(
             cpus,
             image_pids,
             image_ports,
+            // false: a registry image must actually be fetched before it can run.
+            false,
         )
         .await;
     }
@@ -6617,10 +6619,23 @@ async fn produce_manifest(
         );
     }
     let dockerfile = container_build_file(dir);
-    if dockerfile.is_some() {
-        anyhow::bail!(
-            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Dockerfile and Containerfile source builds; no repository command was run on the host"
-        );
+    if let Some(dockerfile) = dockerfile {
+        return dockerfile_container_manifest(
+            cloud,
+            bid,
+            isolated,
+            dir,
+            &dockerfile,
+            project,
+            incarnation,
+            image_port,
+            image_protocol,
+            image_memory,
+            image_cpus,
+            image_pids,
+            image_ports,
+        )
+        .await;
     }
     if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         if let Some(session) = isolated.as_mut() {
@@ -10289,6 +10304,107 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
+/// Build a `Dockerfile`/`Containerfile` repo into a container manifest.
+///
+/// WHY THIS IS NOT THE ISOLATED BUILDER. `BuildSurface::RepositoryCommands` is
+/// the only surface builder protocol v1 accepts — a `podman build` cannot run
+/// inside the gVisor builder (it needs a container runtime, not a syscall
+/// sandbox). Container deployments already run podman ON THE HOST on every
+/// backend (see the `is_container` note in `start_build`), so the image build
+/// belongs here too: no repository-command is executed, and nothing is
+/// materialized by the sealed builder. This lane used to be a hard refusal
+/// ("BUILD_ISOLATION_UNSUPPORTED_SURFACE ... rejects Dockerfile and
+/// Containerfile source builds"), which failed EVERY Dockerfile repo including
+/// the dashboard's own "Container (Dockerfile)" template; `parse_expose` was
+/// left orphaned by that refusal, which is the tell that the lane was removed
+/// rather than never written.
+async fn dockerfile_container_manifest(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    isolated: Option<&mut IsolatedBuild>,
+    dir: &Path,
+    dockerfile: &Path,
+    project: &str,
+    incarnation: ProjectIncarnation,
+    image_port: Option<u16>,
+    image_protocol: Option<ServiceProtocol>,
+    image_memory: Option<&str>,
+    image_cpus: Option<&str>,
+    image_pids: u32,
+    image_ports: Option<Vec<PortSpec>>,
+) -> anyhow::Result<Manifest> {
+    // No repository command runs on this lane, so the builder session (if one
+    // was opened) must be closed rather than left dangling — same discipline as
+    // the fluid.json lane below.
+    if let Some(session) = isolated {
+        session.finish().await?;
+    }
+    let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
+    let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
+    let log = |s: String| cloud.builds.log(bid, s);
+    // Port: an explicit override wins, else the Dockerfile's own `EXPOSE` /
+    // `ENV PORT=` (`image_container_manifest` still falls back to inspecting
+    // the built image, then 8080).
+    let exposed = parse_expose(dockerfile).await;
+    let port = image_port.or(exposed);
+    if let Some(p) = exposed {
+        log(format!("Dockerfile exposes port {p}."));
+    }
+    // A stable, project-scoped local tag: the same project always rebuilds into
+    // the same tag, so redeploys replace the image instead of accumulating
+    // orphan tags.
+    let tag = format!("hive-{}-{project}:latest", sanitize_tag(project));
+    let path = podman_path_env();
+    log(format!(
+        "Building container image from {} …",
+        dockerfile
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Dockerfile".to_string())
+    ));
+    let t0 = now_ms();
+    let out = Command::new("podman")
+        .args([
+            "build",
+            "-t",
+            &tag,
+            "-f",
+            &dockerfile.to_string_lossy(),
+            &dir.to_string_lossy(),
+        ])
+        .env("PATH", &path)
+        .output()
+        .await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("build failed");
+        anyhow::bail!("podman build failed: {}", msg.trim());
+    }
+    log(format!(
+        "Built image {tag} in {}ms",
+        now_ms().saturating_sub(t0)
+    ));
+    image_container_manifest(
+        cloud,
+        bid,
+        project,
+        incarnation,
+        &tag,
+        port,
+        image_protocol,
+        mem_mib,
+        cpus,
+        image_pids,
+        image_ports,
+        true,
+    )
+    .await
+}
+
 /// Locate a repo's container build file: a `Dockerfile` or its identical twin
 /// `Containerfile` (the vendor-neutral OCI/Buildah/Podman name — byte-for-byte the
 /// same format and instructions). Returns the path to whichever exists, preferring
@@ -10769,15 +10885,31 @@ async fn image_container_manifest(
     cpus: f64,
     pids: u32,
     ports_override: Option<Vec<PortSpec>>,
+    // `true` when the image already exists in the local podman store because
+    // THIS build just built it from a Dockerfile. Pulling a locally built tag
+    // would fail (it is not in any registry), so the pull is skipped and the
+    // build log says so instead of implying a registry fetch.
+    skip_pull: bool,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let path = podman_path_env();
     // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
-    // rejects unqualified refs ("short-name resolution enforced").
-    let qualified = qualify_image_ref(image);
+    // rejects unqualified refs ("short-name resolution enforced") — but ONLY for
+    // images that come from a registry. A locally built tag already resolves in
+    // podman's own store as `localhost/<tag>`; rewriting it to
+    // `docker.io/library/<tag>` points at an image that does not exist, so the
+    // container never starts and the build dies at the readiness probe.
+    let qualified = if skip_pull {
+        image.to_string()
+    } else {
+        qualify_image_ref(image)
+    };
     let image = qualified.as_str();
     // Pull the image (fail the build with the registry error if it can't be fetched —
     // e.g. not found / private registry needing auth).
+    if skip_pull {
+        log(format!("Using locally built image {image} (no registry pull)."));
+    } else {
     log(format!("Pulling image {image} …"));
     let t0 = now_ms();
     let out = Command::new("podman")
@@ -10798,6 +10930,7 @@ async fn image_container_manifest(
         "Pulled {image} in {}ms",
         now_ms().saturating_sub(t0)
     ));
+    }
 
     // Port + protocol: explicit values win outright. Otherwise auto-detect from the
     // image's own `ExposedPorts` (falling back to 8080/http when nothing is exposed
