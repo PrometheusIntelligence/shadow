@@ -222,7 +222,7 @@ export function Landing() {
                 to go straight to the video. `target="_blank"` + `rel` because it
                 leaves the origin, and the href is a plain external URL. */}
             <a
-              href="https://youtu.be/qp_lbhPioZF4"
+              href="https://www.youtube.com/watch?v=qp_lhPioZF4"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 rounded-full bg-white px-6 py-3 text-sm font-medium text-black transition-colors hover:bg-white/90"
