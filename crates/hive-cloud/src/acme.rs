@@ -201,11 +201,163 @@ pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
     Arc::new(cfg)
 }
 
+// ---- fleet-shared TLS session tickets ---------------------------------------
+//
+// rustls resumption is STATEFUL by default: `ServerConfig` ships a 256-entry
+// in-process session cache and no ticketer, so a ticket is only ever redeemable
+// at the node that minted it. Measured on shadw.cloud (2026-09-28, four A
+// records behind one name): a ticket minted by 93.188.162.67 resumes there
+// ("Reused, TLSv1.3") but is refused by 170.106.158.151 and 43.172.25.45
+// ("New, TLSv1.3") — with round-robin DNS that caps the resumption rate at
+// roughly one in four, so three out of four reconnects pay a full handshake.
+//
+// Fix: mint STATELESS tickets under a key every node derives identically, so
+// any node can redeem a ticket any other node issued. The key is derived from
+// `secrets::key_material()` — the same fleet-shared at-rest key this crate
+// already uses to derive per-tenant secrets (`zkauth::derive_secret`) and to
+// seal the ACME private keys themselves. That is deliberate: a node that can
+// read `HIVE_SECRET_KEY` can already recover the TLS signing key, so a derived
+// ticket key grants no capability the fleet secret does not already grant.
+//
+// Forward secrecy stays bounded the way rustls requires ("lifetime must be
+// implemented by key rolling and erasure, *not* by storing a lifetime in the
+// ticket"): the key is re-derived every `TICKET_ROTATE_SECS`, and a ticket is
+// only accepted while its epoch is the current one or the one before it, so a
+// key stops being usable at most 2 x TICKET_ROTATE_SECS after it was first
+// used. 0-RTT is untouched — `max_early_data_size` stays 0, and rustls only
+// offers early data when the ticketer is DISABLED, so enabling it here can
+// never turn into early data on a non-idempotent request.
+
+/// How long one derived ticket key is used for minting (`lifetime()` advertises
+/// this to clients too). Six hours matches rustls's own `Ticketer::new()`.
+const TICKET_ROTATE_SECS: u64 = 6 * 60 * 60;
+
+/// Layout: `[epoch: u64 BE][nonce: 12][ChaCha20-Poly1305 ct + 16-byte tag]`.
+const TICKET_HEADER_LEN: usize = 8 + ring::aead::NONCE_LEN;
+
+/// Upper bound on an accepted ticket. rustls's own ticketer tracked the largest
+/// ciphertext it ever produced for this; a fixed bound is the same defence
+/// against the partitioning-oracle attack (reject absurdly long input before
+/// touching the AEAD) without mutable state on the accept path.
+const TICKET_MAX_LEN: usize = 4096;
+
+/// Domain separator for the derivation — changing it invalidates every
+/// outstanding ticket at once, which is the intended way to force a fleet-wide
+/// reset.
+const TICKET_KEY_DOMAIN: &[u8] = b"hive-tls-session-ticket-v1";
+
+fn shared_tickets_enabled() -> bool {
+    match std::env::var("HIVE_TLS_SHARED_TICKETS").as_deref() {
+        Ok("0") | Ok("false") => false,
+        _ => true,
+    }
+}
+
+fn ticket_epoch(secs: u64) -> u64 {
+    secs / TICKET_ROTATE_SECS
+}
+
+/// The ChaCha20-Poly1305 key for one epoch, derived (never stored) — the same
+/// one every node computes for the same epoch from the same fleet secret.
+/// Cheap enough to redo per handshake: one HMAC-SHA256 over ~40 bytes against
+/// an ECDSA handshake signature that costs three orders of magnitude more.
+fn ticket_key(epoch: u64) -> ring::aead::LessSafeKey {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&crate::secrets::key_material())
+        .expect("32-byte fleet key is a valid HMAC key");
+    mac.update(TICKET_KEY_DOMAIN);
+    mac.update(&epoch.to_be_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, bytes.as_slice())
+        .expect("32-byte derived key is a valid ChaCha20-Poly1305 key");
+    ring::aead::LessSafeKey::new(unbound)
+}
+
+/// Stateless, fleet-shared TLS session tickets.
+#[derive(Debug)]
+pub struct FleetTicketer;
+
+impl rustls::server::ProducesTickets for FleetTicketer {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn lifetime(&self) -> u32 {
+        TICKET_ROTATE_SECS as u32
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        if plain.len() + TICKET_HEADER_LEN > TICKET_MAX_LEN {
+            return None;
+        }
+        let epoch = ticket_epoch(hive_core::now_ms() / 1000);
+        use ring::rand::SecureRandom as _;
+        let mut nonce = [0u8; ring::aead::NONCE_LEN];
+        ring::rand::SystemRandom::new().fill(&mut nonce).ok()?;
+        let mut sealed = plain.to_vec();
+        ticket_key(epoch)
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut sealed,
+            )
+            .ok()?;
+        let mut out = Vec::with_capacity(TICKET_HEADER_LEN + sealed.len());
+        out.extend_from_slice(&epoch.to_be_bytes());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&sealed);
+        Some(out)
+    }
+
+    /// Fully attacker-controlled input: length-checked and epoch-checked before
+    /// the AEAD runs, and any failure is `None` — rustls then simply does not
+    /// offer/accept a PSK and falls back to a full handshake.
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        if cipher.len() <= TICKET_HEADER_LEN || cipher.len() > TICKET_MAX_LEN {
+            return None;
+        }
+        let (epoch_bytes, rest) = cipher.split_at(8);
+        let epoch = u64::from_be_bytes(epoch_bytes.try_into().ok()?);
+        let now = ticket_epoch(hive_core::now_ms() / 1000);
+        // Current epoch, or the one it just rolled out of (so a ticket minted
+        // moments before a rotation still works for up to one more period).
+        if epoch != now && epoch + 1 != now {
+            return None;
+        }
+        let (nonce_bytes, sealed) = rest.split_at(ring::aead::NONCE_LEN);
+        let nonce: [u8; ring::aead::NONCE_LEN] = nonce_bytes.try_into().ok()?;
+        let mut buf = sealed.to_vec();
+        // `open_in_place` returns the plaintext as a SUBSLICE but leaves the
+        // Vec's length alone, so the 16-byte tag is still there. Without this
+        // truncate `ServerSessionValue::read_bytes` sees trailing bytes and the
+        // ticket never decrypts — resumption silently never happens.
+        let plain_len = ticket_key(epoch)
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut buf,
+            )
+            .ok()?
+            .len();
+        buf.truncate(plain_len);
+        Some(buf)
+    }
+}
+
 pub fn server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(SniResolver));
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    if shared_tickets_enabled() {
+        // Stateless and shared: `session_storage`'s 256-entry per-process cache
+        // stops being the resumption path for TLS1.3 (rustls prefers the
+        // ticketer when it is enabled), so a reconnect landing on ANY node
+        // resumes. Off only via HIVE_TLS_SHARED_TICKETS=0, which restores
+        // exactly the previous stateful behaviour.
+        cfg.ticketer = Arc::new(FleetTicketer);
+    }
     Arc::new(cfg)
 }
 

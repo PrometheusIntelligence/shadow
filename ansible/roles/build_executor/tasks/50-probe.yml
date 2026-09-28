@@ -567,7 +567,17 @@
             [ "$delta" -le "{{ ((build_executor_probe_workspace_bytes | int) // 1024) }}" ]
       changed_when: false
 
-    - name: Prove nested rootless Buildah produces a real OCI archive
+    # The broker socket is per-boot and reaches buildah only through the
+    # environment hive-build-init gives the tenant process. `podman exec`
+    # attaches a brand-new process that inherits none of it, so the socket
+    # name is recovered from the supervising init (container PID 1, same
+    # uid) exactly the way build_executor.rs:1392 does for a real build --
+    # without it buildah answers "trusted broker is unavailable: Operation
+    # not permitted" and the probe reports a broken executor that is not
+    # broken. Isolation is chroot, not rootless: the broker's option
+    # allowlist enforces chroot, and build_executor.rs:1380 records that a
+    # rootless invocation has no working path in this image.
+    - name: Prove nested brokered Buildah produces a real OCI archive
       ansible.builtin.command:
         argv:
           - "{{ build_executor_podman_path }}"
@@ -578,16 +588,44 @@
           - -c
           - >-
             rm -f /workspace/over-limit;
-            mkdir -p /workspace/oci-probe;
-            printf 'FROM scratch\nCOPY marker /marker\n' >/workspace/oci-probe/Containerfile;
-            printf verified >/workspace/oci-probe/marker;
-            buildah --storage-driver=vfs bud --isolation=rootless --format=oci
-            --tag hive-build-probe:latest /workspace/oci-probe;
-            buildah --storage-driver=vfs push hive-build-probe:latest
-            oci-archive:/workspace/probe.oci:hive-build-probe;
+            HIVE_BUILDAH_SOCKET=;
+            for p in /proc/[0-9]*; do
+              s=$(/usr/bin/tr '\0' '\n' < "$p/environ" 2>/dev/null | /usr/bin/sed -n 's/^HIVE_BUILDAH_SOCKET=//p') || continue;
+              if test -n "$s"; then HIVE_BUILDAH_SOCKET=$s; break; fi;
+            done;
+            if test -z "$HIVE_BUILDAH_SOCKET"; then
+              echo "no HIVE_BUILDAH_SOCKET in any /proc/<pid>/environ" >&2;
+              for p in /proc/[0-9]*; do
+                echo "$p: $(/usr/bin/tr '\0' '\n' < "$p/environ" 2>/dev/null | /usr/bin/grep -i hive | /usr/bin/head -3 | /usr/bin/tr '\n' ' ')" >&2;
+              done;
+              exit 1; fi;
+            export HIVE_BUILDAH_SOCKET;
+            security=$(buildah __hive_broker_security_v1 2>&1);
+            if test "$security" != broker_security=PASS; then
+              echo "broker security check reported: $security" >&2; exit 1; fi;
+            rm -rf /workspace/oci-probe;
+            mkdir -p /workspace/oci-probe/store /workspace/oci-probe/run /workspace/oci-probe/context;
+            printf 'FROM scratch\nCOPY marker /marker\n' >/workspace/oci-probe/context/Containerfile;
+            printf verified >/workspace/oci-probe/context/marker;
+            buildah --root=/workspace/oci-probe/store --runroot=/workspace/oci-probe/run
+            --storage-driver=vfs bud --isolation=chroot --format=oci --layers=false --no-cache
+            --timestamp=0 --tag localhost/hive-build-probe:latest /workspace/oci-probe/context >/dev/null 2>&1;
+            buildah --root=/workspace/oci-probe/store --runroot=/workspace/oci-probe/run
+            --storage-driver=vfs push --format=oci localhost/hive-build-probe:latest
+            oci-archive:/workspace/probe.oci:hive-build-probe >/dev/null 2>&1;
             test -s /workspace/probe.oci
       changed_when: false
 
+    # /dev/fuse and /dev/net/tun are synthesized by the gVisor sentry in
+    # EVERY runsc container -- measured 2026-09-28 on fc-virginia: both carry
+    # the host's major/minor (10:229, 10:200) but a DIFFERENT st_dev than the
+    # host's /dev (21 vs 6), and /dev/kvm, /dev/mem and /dev/dri all exist on
+    # that host yet are absent inside. Asserting their mere absence therefore
+    # fails on every node and says nothing about passthrough, so the real
+    # property is asserted instead: a device node backed by the host's
+    # devtmpfs would carry the host's st_dev, while the sentry's own nodes
+    # share st_dev with /dev/null. Genuinely dangerous host devices stay on
+    # the absence list.
     - name: Prove IPv6, host paths, host IPC, and dangerous devices are absent
       ansible.builtin.command:
         argv:
@@ -603,8 +641,14 @@
             test ! -e {{ _build_executor_probe_fifo | quote }};
             test ! -e {{ _build_executor_probe_socket | quote }};
             test ! -e {{ _build_executor_probe_shm | quote }};
-            for path in /dev/kvm /dev/mem /dev/fuse /dev/net/tun /dev/dri /dev/nvidia0; do
+            for path in /dev/kvm /dev/mem /dev/dri /dev/nvidia0; do
               test ! -e "$path";
+            done;
+            sandbox_dev=$(/usr/bin/stat -c %d /dev/null);
+            for path in /dev/fuse /dev/net/tun; do
+              if test -e "$path"; then
+                test "$(/usr/bin/stat -c %d "$path")" = "$sandbox_dev";
+              fi;
             done
       changed_when: false
 
@@ -642,8 +686,17 @@
           - --show-error
           - --output
           - /dev/null
-          - "--connect-timeout={{ build_executor_probe_connect_timeout_seconds }}"
-          - "--max-time={{ build_executor_probe_connect_timeout_seconds }}"
+          # The image's curl (8.14.1) rejects the `--opt=value` form and
+          # accepts only `--opt value` -- measured 2026-09-28 inside this
+          # exact image: `--connect-timeout=3` exits 2 "option ... is
+          # unknown" while `--connect-timeout 3` exits 0. With the equals
+          # form every denial probe died on a usage error before sending a
+          # packet, so the deny counters stayed at zero and the probe proved
+          # nothing while still looking like a firewall failure.
+          - --connect-timeout
+          - "{{ build_executor_probe_connect_timeout_seconds }}"
+          - --max-time
+          - "{{ build_executor_probe_connect_timeout_seconds }}"
           - "{{ item }}"
       loop:
         - "http://{{ build_executor_network_gateway }}:{{ build_executor_probe_listener_port }}/"
@@ -732,6 +785,21 @@
       ansible.builtin.set_fact:
         _build_executor_counters_after: "{{ _build_executor_counters_after_raw.stdout | from_json }}"
 
+    # host_denied counts only the INPUT path (traffic delivered to the host
+    # itself), while the other counters sit on FORWARD, so a probe that never
+    # reaches the input path is invisible here. Printing the per-attempt exit
+    # and error alongside both counter snapshots is what makes a short delta
+    # diagnosable instead of a bare "Assertion failed".
+    - name: Report forbidden-attempt outcomes and deny counter deltas
+      ansible.builtin.debug:
+        msg:
+          - "attempts: {{ _build_executor_forbidden_http.results | map(attribute='item') | list }}"
+          - "exit codes: {{ _build_executor_forbidden_http.results | map(attribute='rc') | list }}"
+          - "errors: {{ _build_executor_forbidden_http.results | map(attribute='stderr') | map('trim') | list }}"
+          - "host probe target: {{ build_executor_probe_host_private_ipv4 }}:{{ build_executor_probe_listener_port }}"
+          - "counters before: {{ _build_executor_counters_before }}"
+          - "counters after: {{ _build_executor_counters_after }}"
+
     - name: Require host, reserved, direct-DNS, and lateral deny counter deltas
       ansible.builtin.assert:
         that:
@@ -758,8 +826,10 @@
           - /dev/null
           - --write-out
           - "%{http_code}"
-          - "--connect-timeout={{ build_executor_probe_connect_timeout_seconds }}"
-          - --max-time=15
+          - --connect-timeout
+          - "{{ build_executor_probe_connect_timeout_seconds }}"
+          - --max-time
+          - "15"
           - "{{ build_executor_probe_registry_url }}"
       register: _build_executor_registry_probe
       changed_when: false

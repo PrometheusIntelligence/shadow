@@ -385,6 +385,60 @@
     - name: Verify bun is now runnable
       ansible.builtin.command: /usr/local/bin/bun --version
 
+# pnpm + yarn: the two remaining package managers a tenant repository can name
+# (`pnpm-lock.yaml` / `yarn.lock`, or an explicit install command), and the ONLY
+# two with no provisioning at all before this block — measured 2026-09-25:
+# fc-phoenix had bun, node, npm, pnpm and yarn; fc-virginia had node and npm
+# ONLY, so a `pnpm install` or `yarn install` there died exactly like the
+# `bun install` that prompted the capability probe. Unlike bun (a native
+# binary), both ship through npm, which this role already guarantees — one
+# download channel to audit, and npm resolves the right platform binary.
+#
+# WHY PROVISION WHEN THE CODE NOW DEGRADES: because degradation is a fallback,
+# not a substitute for capability. The build lane falls back to npm so a
+# missing manager never fails a deploy, but `pnpm install --frozen-lockfile`
+# and `npm install` are not interchangeable — a pnpm workspace's
+# `node_modules` layout and its lockfile resolution differ, and a repository
+# pinned to `packageManager: pnpm@X` is asking for pnpm. Advertising the tool
+# only where it genuinely exists and provisioning it fleet-wide are the same
+# fix seen from both ends.
+#
+# VERSIONS PINNED, not `latest`: an unpinned global install makes two
+# reprovisions of the same node two different toolchains, which is exactly the
+# non-determinism the build cache identity and the capability advertisement
+# exist to prevent. Bump deliberately.
+#
+# YARN IS CLASSIC (1.x) on purpose: `yarn` resolves to it on npm, and it is
+# what every `yarn.lock` v1 repository expects. A Berry repository (lockfile
+# v2+, `yarn install --immutable`) still resolves through corepack from its own
+# `packageManager` field — unverified here, and called out rather than papered
+# over.
+- name: Check whether pnpm and yarn are already installed
+  ansible.builtin.command: "{{ item.tool }} --version"
+  register: hive_npm_pm_check
+  failed_when: false
+  changed_when: false
+  loop:
+    - { tool: pnpm, pkg: "pnpm@12.6.0" }
+    - { tool: yarn, pkg: "yarn@1.22.22" }
+
+- name: Install the missing package manager into the global npm prefix
+  # `failed_when: false` above means rc != 0 covers BOTH "absent" and
+  # "present but not runnable" (a broken install), and both are worth
+  # replacing here.
+  when: item.rc != 0
+  ansible.builtin.command: "npm install -g {{ item.item.pkg }}"
+  loop: "{{ hive_npm_pm_check.results }}"
+  loop_control:
+    label: "{{ item.item.tool }}"
+
+- name: Verify pnpm and yarn are now runnable
+  ansible.builtin.command: "{{ item }} --version"
+  changed_when: false
+  loop:
+    - pnpm
+    - yarn
+
 - name: podman socket enabled (git.rs / sandboxes_platform.rs shell out to podman directly, not via the socket, but keep it available for tooling)
   ansible.builtin.systemd:
     name: podman.socket

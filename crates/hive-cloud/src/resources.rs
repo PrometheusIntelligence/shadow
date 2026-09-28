@@ -25,10 +25,10 @@ pub fn capacity() -> (u32, u64, u64) {
     (cores, mem_total_mb, disk_total_bytes / 1024 / 1024 / 1024)
 }
 
-/// The three runtime capabilities placement consumes from one observation of
-/// the active backend. Keeping them in one value makes both boot publication
-/// and periodic refresh use one backend/config/image verdict.
-#[derive(Clone, Copy, Debug)]
+/// The capabilities placement consumes from one observation of the active
+/// backend. Keeping them in one value makes both boot publication and periodic
+/// refresh use one backend/config/image verdict.
+#[derive(Clone, Debug)]
 pub struct RuntimeCapabilities {
     pub wasm_runtime: Option<bool>,
     /// Can this node's active backend actually run a `Runtime::Bun` function?
@@ -37,6 +37,19 @@ pub struct RuntimeCapabilities {
     /// syscall shim panics on Bun's own boot probe).
     pub bun_runtime: Option<bool>,
     pub runtime_artifact_protocol: Option<u16>,
+    /// Package managers / toolchains this node can execute in its BUILD lane,
+    /// probed rather than assumed (see [`BUILD_TOOLCHAINS`]).
+    ///
+    /// `None` = UNREPORTED, and — deliberately unlike `wasm_runtime`/`bun_runtime`
+    /// above, where `None` means NOT CAPABLE — here it means UNKNOWN and is
+    /// ADMITTED by placement. The asymmetry is real and it is about the failure
+    /// direction: a missing package manager has a SUBSTITUTE (npm ships with
+    /// node), so an unreported node is not guaranteed to fail and the build lane
+    /// degrades honestly instead; excluding every unreported peer would empty the
+    /// candidate set mid-rollout, the `retain_dialable` partition lesson.
+    /// Firecracker reports `None` on purpose — its builds run inside the builder
+    /// image, which this host can neither see nor stat.
+    pub build_toolchains: Option<Vec<String>>,
 }
 
 /// The backend selected by `main`, including the exact Firecracker image
@@ -128,6 +141,12 @@ impl RuntimeCapabilitySource {
                     wasm_runtime: Some(regular_file(wasmer_marker)),
                     bun_runtime: Some(regular_file(bun_marker)),
                     runtime_artifact_protocol: Some(protocol),
+                    // Builds run INSIDE the pinned builder image, never against
+                    // this host's PATH — reporting a host probe here would
+                    // advertise a filesystem no build command ever execs
+                    // against. Unreported (= unknown, admitted by placement);
+                    // the image lane is probed live at build time instead.
+                    build_toolchains: None,
                 },
                 Err(error) => {
                     tracing::warn!(
@@ -139,6 +158,7 @@ impl RuntimeCapabilitySource {
                         wasm_runtime: Some(false),
                         bun_runtime: Some(false),
                         runtime_artifact_protocol: None,
+                        build_toolchains: None,
                     }
                 }
             },
@@ -148,12 +168,16 @@ impl RuntimeCapabilitySource {
                     // Always false — see this method's doc.
                     bun_runtime: Some(false),
                     runtime_artifact_protocol: Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION),
+                    // Litebox builds run as HOST processes, so the host PATH is
+                    // exactly the filesystem the build commands exec against.
+                    build_toolchains: Some(detect_host_build_toolchains()),
                 }
             }
             RuntimeCapabilityBackend::Litebox(_) => RuntimeCapabilities {
                 wasm_runtime: Some(false),
                 bun_runtime: Some(false),
                 runtime_artifact_protocol: None,
+                build_toolchains: None,
             },
             // Mock may truthfully exec a host Wasmer/Bun, but it is never an
             // isolated runtime-artifact backend.
@@ -161,6 +185,7 @@ impl RuntimeCapabilitySource {
                 wasm_runtime: Some(which_on_path("wasmer").is_some()),
                 bun_runtime: Some(which_on_path("bun").is_some()),
                 runtime_artifact_protocol: None,
+                build_toolchains: Some(detect_host_build_toolchains()),
             },
         }
     }
@@ -180,6 +205,107 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|d| d.join(name))
         .find(|c| c.is_file())
+}
+
+/// Package managers / toolchains a repository BUILD may invoke, in the
+/// canonical probe order — which is also the order they appear in
+/// `NodeInfo::build_toolchains`, so every observer reads the same list.
+///
+/// PROBED, NEVER ASSUMED, and probed against the filesystem the build ACTUALLY
+/// execs against — the `wasmer`/`bun` runtime lesson applied to the build lane.
+/// `git.rs` picks the build lane by BACKEND: mock/litebox run repository
+/// commands as plain HOST processes, firecracker runs them inside the pinned
+/// builder image. A host PATH probe is therefore authoritative for the
+/// host-exec lane and MEANINGLESS for the image lane, which is why
+/// `RuntimeCapabilities::build_toolchains` is `None` on firecracker: the image's
+/// toolchain is asserted by provisioning (`ansible/roles/build_executor`, whose
+/// live probe requires `node npm corepack bun python3 go`) and re-probed at
+/// build time through the same session that will run the command — never
+/// inferred from the host.
+pub const BUILD_TOOLCHAINS: [(&str, u32); 7] = [
+    ("node", 1),
+    ("npm", 1 << 1),
+    ("pnpm", 1 << 2),
+    ("yarn", 1 << 3),
+    ("bun", 1 << 4),
+    ("go", 1 << 5),
+    ("python3", 1 << 6),
+];
+
+/// Bit for `name`, or `None` when it is not a toolchain the build lane probes
+/// (a bare-word command naming anything else is never substituted).
+pub fn build_toolchain_bit(name: &str) -> Option<u32> {
+    BUILD_TOOLCHAINS
+        .iter()
+        .find(|(tool, _)| *tool == name)
+        .map(|(_, bit)| *bit)
+}
+
+/// Render a probe bitmask back into canonical names (the wire form
+/// `NodeInfo::build_toolchains` carries, so `/v1/nodes` reads as
+/// `["node","npm"]` and not as an opaque integer).
+pub fn build_toolchain_names(bits: u32) -> Vec<String> {
+    BUILD_TOOLCHAINS
+        .iter()
+        .filter(|(_, bit)| bits & bit != 0)
+        .map(|(tool, _)| (*tool).to_string())
+        .collect()
+}
+
+/// Probe the HOST PATH — authoritative for the host-exec build lane
+/// (mock/litebox), where repository commands run as plain child processes
+/// inheriting this process's PATH.
+pub fn detect_host_build_toolchains() -> Vec<String> {
+    BUILD_TOOLCHAINS
+        .iter()
+        .filter(|(tool, _)| which_on_path(tool).is_some())
+        .map(|(tool, _)| (*tool).to_string())
+        .collect()
+}
+
+/// A `/bin/sh` script whose EXIT CODE is the build-toolchain bitmask.
+///
+/// Used to probe whatever filesystem the build lane execs against — the host
+/// checkout (mock/litebox) or the inside of the isolated builder image
+/// (firecracker) — through the very session that will run the repository
+/// commands, so the answer cannot disagree with the command's own resolution.
+/// Deliberately exit-code based: the one build primitive available
+/// (`IsolatedBuild::run`) reports an exit status and streams stdout into the
+/// tenant's build log, so a stdout-based probe would either need a second
+/// channel or leak into that log. `if`-guarded so it is safe under `set -e`
+/// and `set -u`.
+pub fn build_toolchain_probe_script() -> String {
+    let mut script = String::from("bits=0");
+    for (tool, bit) in BUILD_TOOLCHAINS {
+        script.push_str(&format!(
+            "\nif command -v {tool} >/dev/null 2>&1; then bits=$((bits + {bit})); fi"
+        ));
+    }
+    script.push_str("\nexit $bits\n");
+    script
+}
+
+/// Substitute preference for an ABSENT package manager: the first of these that
+/// the build lane actually has. `npm` leads because it ships with node — the
+/// one toolchain every node that can build at all is guaranteed to carry — so
+/// a missing `bun`/`pnpm`/`yarn` degrades to a working install instead of
+/// failing the build.
+pub const PACKAGE_MANAGER_SUBSTITUTES: [&str; 3] = ["npm", "pnpm", "yarn"];
+
+/// The package manager to use instead of the absent `requested` one, given the
+/// toolchains the build lane actually has. `None` when no substitute exists,
+/// which the caller must report as a build-environment fault naming the missing
+/// binary — never as the tenant's application failing.
+pub fn package_manager_substitute(requested: &str, available: &[String]) -> Option<&'static str> {
+    // A manager that IS present needs no substitute — answering here would let
+    // a caller swap a working toolchain for a different one.
+    if available.iter().any(|a| a == requested) {
+        return None;
+    }
+    PACKAGE_MANAGER_SUBSTITUTES
+        .iter()
+        .copied()
+        .find(|candidate| *candidate != requested && available.iter().any(|a| a == candidate))
 }
 
 /// GPUs on this host, probed ONCE at boot (mirrors `capacity()`'s once-at-boot

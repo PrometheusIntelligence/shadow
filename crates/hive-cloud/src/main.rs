@@ -874,6 +874,7 @@ async fn async_main() -> anyhow::Result<()> {
     let wasm_rt = runtime_capabilities.wasm_runtime;
     let bun_rt = runtime_capabilities.bun_runtime;
     let runtime_artifact_protocol = runtime_capabilities.runtime_artifact_protocol;
+    let build_toolchains = runtime_capabilities.build_toolchains.clone();
     // A declaration is never enough: initialization re-hashes runsc and the
     // nft policy, checks the exact network/image/runtime, then executes a real
     // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
@@ -1179,6 +1180,11 @@ async fn async_main() -> anyhow::Result<()> {
         wasm_runtime: wasm_rt,
         bun_runtime: bun_rt,
         runtime_artifact_protocol,
+        // Seeded from the same boot observation as `wasm_rt`/`bun_rt`, so the
+        // first gossip round already carries a real verdict; `spawn_disk_refresh`
+        // re-probes it on its tick. `None` on a microVM backend: those builds
+        // run inside the builder image, not against this host's PATH.
+        build_toolchains: build_toolchains.clone(),
         // The executor may be initialized above, but this stays fail-closed until
         // every git build surface consumes it in this binary.
         build_isolation_protocol: None,
@@ -1200,6 +1206,10 @@ async fn async_main() -> anyhow::Result<()> {
         wasm_runtime = wasm_rt.unwrap_or(false),
         bun_runtime = bun_rt.unwrap_or(false),
         runtime_artifact_protocol = ?runtime_artifact_protocol,
+        build_toolchains = %build_toolchains
+            .as_deref()
+            .map(|toolchains| toolchains.join(","))
+            .unwrap_or_else(|| "unreported".to_string()),
         "node host capacity"
     );
     if wasm_rt != Some(true) {
@@ -1215,6 +1225,24 @@ async fn async_main() -> anyhow::Result<()> {
             "no bun runtime on the filesystem this node's functions exec against — \
              Runtime::Bun deployments will not be placed here (see the active-backend capability probe)"
         );
+    }
+    // Build toolchains: a MISSING package manager is not a refusal, it is a
+    // SUBSTITUTION (npm ships with node, so a `bun install` degrades to `npm
+    // install` with a loud log). This line exists so the fleet's real spread is
+    // visible in the journal — measured when the probe was added: bun present
+    // on fc-phoenix, absent on fc-virginia and 170.106.158.151, with the build
+    // pipeline dispatching `bun install` to all three.
+    match build_toolchains.as_ref() {
+        None => tracing::info!(
+            backend = %backend_name,
+            "build toolchains not probed on this node's build filesystem — \
+             package-manager selection will not be placement-filtered here"
+        ),
+        Some(toolchains) => tracing::info!(
+            backend = %backend_name,
+            toolchains = %toolchains.join(","),
+            "build toolchains probed on the filesystem this node's builds exec against"
+        ),
     }
     let registry = NodeRegistry::new(me);
     // Populate this node's own relay_url now that `registry` exists (mirrors
@@ -3386,6 +3414,7 @@ fn spawn_disk_refresh(
                     runtime_capabilities.wasm_runtime,
                     runtime_capabilities.bun_runtime,
                     runtime_capabilities.runtime_artifact_protocol,
+                    runtime_capabilities.build_toolchains.clone(),
                 );
                 // Same tick, same reason as the disk figure: the restart
                 // audit's 24h window SLIDES, so a boot-time-only value goes

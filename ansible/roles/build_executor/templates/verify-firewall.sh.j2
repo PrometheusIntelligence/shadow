@@ -131,11 +131,23 @@ if f"runsc version {capability['runsc_version']}" not in runsc_version.stdout.sp
 podman = capability["podman_path"]
 subprocess.run([podman, "--version"], env=clean_env, capture_output=True, timeout=10, check=True)
 
+# The capability pins the image as a digest (`sha256:<64hex>`) because that
+# is the unambiguous immutable form, but `podman image inspect` reports Id as
+# BARE hex -- measured 2026-09-28 on fc-virginia: inspect returned
+# `3c7f08e2e6ac...` against a capability holding `sha256:3c7f08e2e6ac...`, so
+# a plain string compare failed with "immutable builder image is absent or
+# changed" while the image was present and correct. Both sides are normalized
+# to bare hex before comparison; the digest form is still what gets pinned.
+def image_digest(value):
+    value = str(value or "")
+    return value[7:] if value.startswith("sha256:") else value
+
+
 image_rows = json.loads(subprocess.check_output(
     [podman, "image", "inspect", capability["builder_image_id"]],
     env=clean_env, text=True, timeout=20,
 ))
-if len(image_rows) != 1 or image_rows[0].get("Id") != capability["builder_image_id"]:
+if len(image_rows) != 1 or image_digest(image_rows[0].get("Id")) != image_digest(capability["builder_image_id"]):
     raise SystemExit("immutable builder image is absent or changed")
 image_config = image_rows[0].get("Config") or {}
 expected_user = f"{capability['builder_uid']}:{capability['builder_gid']}"

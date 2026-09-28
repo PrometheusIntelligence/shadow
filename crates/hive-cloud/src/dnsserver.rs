@@ -974,6 +974,7 @@ mod tests {
             gpu_count: 0,
             wasm_runtime: None,
             bun_runtime: None,
+            build_toolchains: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             artifact_transfer_protocol: None,

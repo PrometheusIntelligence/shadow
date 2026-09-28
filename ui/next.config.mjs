@@ -1,3 +1,5 @@
+import { clerkFrontendOrigin } from "./lib/clerk-origin.mjs";
+
 /** @type {import('next').NextConfig} */
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 // Ops/admin console API base. The developer/API-key surface is `/cloud` -> ADMIN
@@ -24,29 +26,13 @@ function zoneRewrites() {
   return out;
 }
 
-// Clerk frontend-API origin, derived from the publishable key (the key's
-// payload IS the frontend host, base64 with a trailing '$'). This keeps the
-// CSP below in lockstep with whichever Clerk instance is configured:
-//  - pk_test_… decodes to <slug>.clerk.accounts.dev (third-party dev instance)
-//  - pk_live_… decodes to clerk.<our-domain> (first-party production instance)
+// Clerk frontend-API origin — see lib/clerk-origin.mjs (shared with the root
+// layout's preconnect hint so the two never drift).
 // On a LIVE key the `*.clerk.accounts.dev` wildcard is dropped entirely — any
 // stranger can mint a dev instance under that wildcard, so in production it is
 // an open exfiltration destination, not a convenience.
-function clerkFrontendOrigin() {
-  const pk = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "";
-  const m = /^pk_(test|live)_([A-Za-z0-9+/=]+)$/.exec(pk);
-  if (!m) return null;
-  try {
-    const host = Buffer.from(m[2], "base64").toString("utf8").replace(/\$$/, "").trim();
-    // Hostname shape only — never let a malformed env value inject CSP tokens.
-    if (/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(host)) return `https://${host}`;
-  } catch {
-    /* fall through to null */
-  }
-  return null;
-}
 const CLERK_CSP_ORIGINS = (() => {
-  const derived = clerkFrontendOrigin();
+  const derived = clerkFrontendOrigin(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);
   const live = (process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "").startsWith("pk_live_");
   if (live && derived) return derived;
   return [...new Set([derived, "https://*.clerk.accounts.dev"].filter(Boolean))].join(" ");
@@ -171,6 +157,13 @@ const nextConfig = {
     const PUBLIC_CACHE = "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
     const PRIVATE_CACHE = "private, max-age=60, stale-while-revalidate=300";
     const NO_STORE = "private, no-store, max-age=0, must-revalidate";
+    // "/" is a fully prerendered shell (auth flip is client-side) so it is
+    // publicly cacheable, but it is ALSO the signed-in dashboard home — a stale
+    // copy from before a redeploy would reference dead content-hashed chunks,
+    // so its window stays far shorter than PUBLIC_CACHE's. Kept byte-identical
+    // to LANDING_CACHE in proxy.ts (the middleware is what actually sets the
+    // header; this entry is the backstop for when the matcher doesn't match).
+    const LANDING_CACHE = "public, max-age=60, s-maxage=300, stale-while-revalidate=300";
     const cc = (value) => [{ key: "Cache-Control", value }];
     const noStorePaths = [
       "/account/:path*",
@@ -191,7 +184,6 @@ const nextConfig = {
       "/wfc/:path*",
     ];
     const publicPaths = [
-      "/",
       "/product/:path*",
       "/solutions/:path*",
       "/features/:path*",
@@ -294,6 +286,7 @@ const nextConfig = {
       { source: "/_next/static/:path*", headers: cc("public, max-age=31536000, immutable") },
       // Sensitive / dynamic management surfaces — never cache.
       ...noStorePaths.map((source) => ({ source, headers: cc(NO_STORE) })),
+      // The landing route: same value as proxy.ts's LANDING_CACHE.
       // Public marketing / docs / status — shared (CDN) + browser cacheable.
       ...publicPaths.map((source) => ({ source, headers: cc(PUBLIC_CACHE) })),
       // Other authenticated dashboard tabs — short private browser cache of the
@@ -304,6 +297,11 @@ const nextConfig = {
           "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up|workflows|wfc|assets)[^.]*)",
         headers: cc(PRIVATE_CACHE),
       },
+      // Landing route, LAST so it wins over the catch-all above (which "/"
+      // otherwise also matches with its empty `[^.]*` tail). Same value as
+      // proxy.ts's LANDING_CACHE — the middleware is what actually sets it on
+      // every request; this is the backstop for when the matcher doesn't match.
+      { source: "/", headers: cc(LANDING_CACHE) },
     ];
   },
 };

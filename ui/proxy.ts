@@ -43,6 +43,36 @@ const isPublic = createRouteMatcher([
   "/wfc(.*)",
 ]);
 
+// Public routes that need NO Clerk machinery at all — not merely "no
+// `protect()`". `isPublic` above only skips the auth CHECK; `clerkMiddleware`
+// itself still runs for every request it matches (decorating the request with
+// `x-clerk-auth-*` headers and running its dev-browser handshake), which is
+// per-request work on routes whose HTML is fully prerendered and identical for
+// every visitor. Measured on the live landing page: `x-clerk-auth-status:
+// signed-out` on a `x-nextjs-prerender: 1` response.
+//
+// Enumerated positively (never an inverted matcher) and deliberately narrower
+// than `isPublic`: only routes whose prerendered HTML carries no per-user data
+// AND that never call `auth()`/`currentUser()` server-side. Everything else —
+// /sign-in, /sign-up, /cloud, /api, /ops, /wfc, /oauth/github/callback — keeps
+// Clerk exactly as before. If a route's public-ness is in doubt it stays here
+// OUT of this list, i.e. Clerk-protected.
+const isClerkFree = createRouteMatcher([
+  "/", // public Shadow landing: prerendered, auth flip is client-side (app/page.tsx)
+  "/docs(.*)",
+  "/product(.*)",
+  "/solutions(.*)",
+  "/features(.*)",
+  "/pricing(.*)",
+  "/blog(.*)",
+  "/case-studies(.*)",
+  "/contact(.*)",
+  "/privacy(.*)",
+  "/status(.*)",
+  "/offline.html", // PWA offline fallback (precached by the service worker)
+  "/sw.js", // service worker
+]);
+
 // Dev-only escape hatch: set HIVE_AUTH_BYPASS=1 to disable login gating entirely
 // (used for headless screenshots / local previews). Never set in production —
 // and now enforced, not just a comment: a stray HIVE_AUTH_BYPASS=1 accidentally
@@ -55,16 +85,12 @@ const bypass = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== 
 // personal settings, team settings + org management, project settings, project
 // deployments, the network tab, and billing/admin. Stale views here are unsafe.
 const NO_STORE = [
-  // The home route: page.tsx keeps it `force-dynamic` and its body flips
-  // landing↔dashboard on CLIENT auth state. It was previously in PUBLIC_PAGES
-  // (`public, s-maxage=3600, stale-while-revalidate=86400`) — which let any
-  // shared cache hold a per-request-rendered document for an hour and let the
-  // browser serve it stale for a DAY with no `Vary: Cookie`, so post-redeploy
-  // (or mid sign-in/sign-out) mobile browsers could keep re-serving a stale
-  // shell referencing dead content-hashed chunks — the same class the
-  // /workflows entry below documents. The service worker's "network-first"
-  // navigation fetch honors this HTTP cache too, so `public` here defeated it.
-  /^\/$/,
+  // NOTE: "/" is deliberately NOT here any more — see LANDING_CACHE below and
+  // the note in app/page.tsx: the home shell is now a fully prerendered Static
+  // route (build output: `○ /`) with ZERO server-side data access, so its HTML
+  // is byte-identical for every visitor and every deploy. It used to be
+  // force-dynamic with a server-side landing<->dashboard flip, which is what
+  // made a shared cache unsafe then; that flip is now client-side only.
   /^\/account(\/|$)/,
   /^\/settings(\/|$)/,
   /^\/teams(\/|$)/,
@@ -81,13 +107,25 @@ const NO_STORE = [
 ];
 
 // Public marketing / docs / status pages — shared (CDN) + browser cacheable.
-// Deliberately NOT here: "/" (force-dynamic auth flip — see NO_STORE) and
-// /sign-in|/sign-up (auth surfaces; Clerk's middleware/handshake acts
-// per-request around them, and a shared cache must never hold their
-// responses — they fall through to the `private` default below).
+// Deliberately NOT here: /sign-in|/sign-up (auth surfaces; Clerk's
+// middleware/handshake acts per-request around them, and a shared cache must
+// never hold their responses — they fall through to the `private` default
+// below). "/" gets its own tighter window below.
 const PUBLIC_PAGES = [
   /^\/(product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status)(\/|$)/,
 ];
+
+// The landing route is cacheable PUBLICLY for the reason documented on
+// NO_STORE (fully prerendered, zero server-side data access, auth flip is
+// client-side), but with a deliberately SHORTER window than the marketing
+// pages: "/" is also the signed-in dashboard home, so a stale shell left over
+// from before a redeploy would reference that build's now-deleted
+// content-hashed chunks and render unstyled. s-maxage + SWR therefore caps
+// total staleness at 10 minutes instead of the marketing pages' ~25 hours.
+// `max-age=60` is what actually buys the repeat-visit win: within a minute a
+// returning visitor issues no request at all, and after that Next's ETag turns
+// the revalidation into a 304 instead of a 23 KB render.
+const LANDING_CACHE = "public, max-age=60, s-maxage=300, stale-while-revalidate=300";
 
 /**
  * Reasonable Cache-Control for a dashboard/marketing route to cut traffic and
@@ -97,6 +135,7 @@ const PUBLIC_PAGES = [
 function cacheControlFor(pathname: string): string | null {
   if (pathname.startsWith("/cloud") || pathname.startsWith("/ops") || pathname.startsWith("/api")) return null;
   if (NO_STORE.some((re) => re.test(pathname))) return "private, no-store, max-age=0, must-revalidate";
+  if (pathname === "/") return LANDING_CACHE;
   if (PUBLIC_PAGES.some((re) => re.test(pathname)))
     return "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
   // Other authenticated dashboard tabs: cache the page shell briefly in the
@@ -330,6 +369,10 @@ export const proxy = bypass
     )
   : corsWrapped(
       async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
+        // Enumerated public routes never enter Clerk at all (see isClerkFree).
+        // No auth check is skipped here that `isPublic` was doing: these are
+        // exactly the routes that were already served without `protect()`.
+        if (isClerkFree(req)) return withCache(req, NextResponse.next());
         const res = await clerk(req, event);
         return neutralizeClerkSelfRewrite(req, res ?? NextResponse.next());
       },

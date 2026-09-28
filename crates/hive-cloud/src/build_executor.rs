@@ -1374,11 +1374,19 @@ impl BuildExecutor {
             .podman_output([os("start"), os(&writer)], Duration::from_secs(30))
             .await?;
         require_success("probe start runsc sandbox", &started)?;
-        // Exec'd processes never inherit the init's broker environment, so
-        // the probe recovers the per-boot abstract socket name from the
-        // supervising init (container PID 1, same uid) and talks to the
-        // broker exactly the way tenant mains do. Buildah runs brokered with
-        // the chroot isolation the broker's option allowlist enforces; a
+        // Exec'd processes never inherit the broker environment, so the probe
+        // has to recover the per-boot ABSTRACT socket name to talk to the
+        // broker the way tenant mains do. It is NOT in the init's own
+        // environment: measured 2026-09-28 on fc-virginia inside a live
+        // sandbox, PID 1 (hive-build-init) carried 31 variables and none of
+        // them HIVE_BUILDAH_*, while the tenant processes carried both
+        // `HIVE_BUILDAH_SOCKET=@hive-buildah-<32hex>` and
+        // HIVE_BUILDAH_BROKER_PID. Reading only /proc/1/environ therefore
+        // yielded an empty name, `test -n` failed, and the whole probe failed
+        // with BUILD_ISOLATION_UNAVAILABLE on a perfectly working executor --
+        // which is why no node ever advertised build-isolation protocol v1.
+        // Scan every readable environ instead. Buildah then runs brokered
+        // with the chroot isolation the broker's option allowlist enforces; a
         // direct or rootless invocation has no working path in this image.
         let script = "set -eu; \
             test \"$(cat /proc/gvisor/kernel_is_gvisor)\" = gvisor; \
@@ -1389,7 +1397,11 @@ impl BuildExecutor {
             /usr/bin/tail -n 1 /workspace/.hive-selfcheck.out | /usr/bin/grep -qx selfcheck=PASS; \
             for c in docker podman nerdctl; do ! command -v \"$c\" >/dev/null 2>&1; done; \
             test \"$(command -v buildah)\" = /usr/local/bin/buildah; \
-            HIVE_BUILDAH_SOCKET=$(/usr/bin/tr '\\0' '\\n' < /proc/1/environ | /usr/bin/sed -n 's/^HIVE_BUILDAH_SOCKET=//p'); \
+            HIVE_BUILDAH_SOCKET=; \
+            for p in /proc/[0-9]*; do \
+              s=$(/usr/bin/tr '\\0' '\\n' < \"$p/environ\" 2>/dev/null | /usr/bin/sed -n 's/^HIVE_BUILDAH_SOCKET=//p') || continue; \
+              if test -n \"$s\"; then HIVE_BUILDAH_SOCKET=$s; break; fi; \
+            done; \
             test -n \"$HIVE_BUILDAH_SOCKET\"; export HIVE_BUILDAH_SOCKET; \
             test \"$(buildah __hive_broker_security_v1)\" = broker_security=PASS; \
             set -- $(/usr/bin/stat -f -c '%S %b' /workspace); \
@@ -1746,6 +1758,18 @@ impl BuildExecutor {
             os("--tmpfs"),
             os(format!(
                 "/run:rw,nodev,nosuid,noexec,size={tmpfs_each},mode=0755"
+            )),
+            // Buildah's vfs store creates its lock directory under /run/lock,
+            // which the root-owned mode-0755 /run tmpfs denies the tenant.
+            // Measured 2026-09-28 on fc-virginia: the nested build died with
+            // "creating build container: creating lock file directory: mkdir
+            // /run/lock: permission denied", failing the executor probe on a
+            // node whose executor was otherwise healthy and keeping the node
+            // from ever advertising build-isolation protocol v1. Give the
+            // lock path its own writable tmpfs rather than loosening /run.
+            os("--tmpfs"),
+            os(format!(
+                "/run/lock:rw,nodev,nosuid,noexec,size={tmpfs_each},mode=1777"
             )),
             os("--tmpfs"),
             os(format!(

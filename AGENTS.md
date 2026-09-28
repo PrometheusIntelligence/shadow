@@ -1361,6 +1361,57 @@ releases).
   FAILS THE BUILD loudly; the deployment is never registered. Never "warn and
   drop the opt-in": that leaves the fleet serving code donors believe they
   serve.
+- **A Node/Bun function with no entry of its own gets a GENERATED one, never a
+  refusal** (browser-auto-generated-entry). `git::synthesize_browser_entry`
+  stages `.hive-browser-entry-<fn>.cjs` into the deployment root whenever
+  inference (`infer_browser_entry` / `infer_package_server_entry`) finds
+  nothing, and again when an inferred entry EXISTS but `bundle()`'s gate
+  rejects it — a real server binds a port and exports no handler, which is
+  exactly the shape the generated adapter exists to host. So a tenant never has
+  to ship `api.browser.js` / `browser.js` / `handler.js` / `index.js` /
+  `main.js`, a `package.json` main/module/exports/scripts.start JS file, or a
+  framework build output. One adapter module (`assets/browser-adapter.cjs`)
+  plus one framework probe table (`BROWSER_SERVER_PROBES`), never per-framework
+  codegen: the server the table locates is EMBEDDED as CommonJS (a browser
+  artifact is ONE file — the guest's filesystem holds the artifact and nothing
+  else, so a server that imports siblings or node_modules cannot resolve
+  there), the remaining candidates are probed with a GUARDED `require` at
+  runtime in table order, and each miss is a skipped attempt, never a crash.
+  Probe specifiers are RELATIVE (`./…`): the artifact's own directory is the
+  guest `require` base, and a BARE specifier resolves through `node_modules`,
+  which a one-file artifact never has — the bare form made every runtime probe
+  a guaranteed MODULE_NOT_FOUND, i.e. a dead fallback. It adapts a callable
+  export (Express/Connect app, Next/Nuxt/SvelteKit
+  handler, bare `(req, res)`), an object owning `.handler`/`.handle`/`.app`/`.fetch`
+  (Hono, Worker-shaped), ESM/CJS double-wrapping, or the listener a
+  self-starting server handed to `http.createServer` — captured through a stub
+  that answers `require("http")`, because there is no inbound socket in a
+  donor's browser and nothing to bind. That stub is HONEST, never a no-op:
+  `listen()` invokes its callback and emits `'listening'`, `on`/`once`/`emit`
+  are a real registry, `address()` reports the requested port — a server gated
+  on `await new Promise(r => server.listen(0, r))` or a top-level
+  `await once(server, 'listening')` completes instead of hanging the runner.
+  The embedded server is evaluated EXACTLY ONCE (a promise memoized on
+  `globalThis` and awaited by every invocation): `bundle()` embeds the adapter
+  verbatim inside the `async function (request, ops)` it exports, so a
+  top-level statement there re-ran the whole server program per request.
+  `res.statusCode`/`res.statusMessage` are ACCESSORS over the one place the
+  response status lives, so `res.statusCode = 404` reaches the envelope
+  instead of being dropped for a 200. Nothing
+  adapt-able ⇒ the exported handler throws a named `HiveBrowserAdapterError` at
+  the point of use naming everything it probed, never a silent 200 — and a
+  build that locates NO server refuses to synthesize at all (rather than
+  stamping an entry that always throws): `synthesize_browser_entry` Errs and
+  the auto pass records a `browser_ineligible_reason` naming what it looked
+  for. The adapter
+  adds NO capability (no host path, no port, no fork, no `ops` beyond
+  `ops.call`), and it embeds nothing that `bundle()`'s unimplementable-surface
+  scan would refuse — that scan runs on the located server BEFORE it is
+  embedded. Assignment needs no extra gate: `bundle()` succeeding stamps
+  `browser_artifact`, which is what `DeploymentInfo::browser_functions`,
+  `eligible_for_tenant`, `descriptor_for` and `set_browser_targets` all key on.
+  Zero-command static deploys (no functions), non-JS runtimes (excluded by the
+  `Runtime::resolve` check) and explicit fluid.json opt-ins are untouched.
 - **Node/framework surfaces are NOT a rejection — the substrate is a real Node
   runtime** (vendored node-worker: Node v25.9.0's own lib transpiled for a
   Worker), which supplies `require`, `process`, `Buffer` and `fetch`.

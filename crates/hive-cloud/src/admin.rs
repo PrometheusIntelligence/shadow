@@ -12521,7 +12521,7 @@ async fn database_create(
         .filter(|r| !r.is_empty())
         .and_then(|region| {
             let regions = [region.to_string()];
-            crate::schedule::place(&c, &regions, true, true, false, false, false, false)
+            crate::schedule::place(&c, &regions, true, true, false, false, false, false, None)
                 .into_iter()
                 .next()
         })

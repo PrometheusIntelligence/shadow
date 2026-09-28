@@ -79,6 +79,11 @@ pub fn place_for_project(
     needs_interpreter: impl Into<InterpreterNeeds>,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
+    // The package manager this project's BUILD needs (from an explicit
+    // install/build command, or the repo's lockfile on a redeploy), when it is
+    // knowable before the build runs. `None` = nothing package-manager-shaped
+    // resolved yet — nothing is gated on it.
+    needs_build_toolchain: Option<&str>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
     if let Some(holder) = cloud.leases.owner_of(project) {
@@ -101,6 +106,12 @@ pub fn place_for_project(
             let bun_ok = bun_capable(n, needs_interpreter.bun);
             let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
             let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
+            // Stickiness must not out-rank capability here either: a lease held
+            // from before the project's install command switched to `bun install`
+            // would otherwise pin every redeploy to a node with no `bun`, which
+            // is the exact `/bin/sh: line 1: bun: command not found` failure
+            // this field was added for.
+            let build_toolchain_ok = build_toolchain_capable(n, needs_build_toolchain);
             if n.healthy
                 && region_ok
                 && reachable
@@ -109,6 +120,7 @@ pub fn place_for_project(
                 && bun_ok
                 && runtime_artifact_ok
                 && build_isolation_ok
+                && build_toolchain_ok
             {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 // Carry BOTH transports whenever both are known. They are
@@ -150,6 +162,7 @@ pub fn place_for_project(
         needs_interpreter,
         needs_runtime_artifact,
         needs_build_isolation,
+        needs_build_toolchain,
     )
 }
 
@@ -229,6 +242,60 @@ pub fn runtime_artifact_capable(n: &NodeInfo, needed: bool) -> bool {
     !needed || n.runtime_artifact_protocol == Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION)
 }
 
+/// May `n`'s BUILD LANE run a build whose package manager is `manager`?
+///
+/// ONE definition, used by `place`'s capability filter, by
+/// `place_for_project`'s lease-stickiness fast path AND by
+/// `dispatch_fallbacks` — the three answering differently is exactly how a
+/// capability gate springs a leak, the same rationale `wasm_capable` and
+/// `bun_capable` already carry.
+///
+/// `None` (no toolchain reported) means UNKNOWN and is ADMITTED, deliberately
+/// unlike `wasm_capable`/`bun_capable`: a missing PACKAGE MANAGER has a
+/// substitute (`npm` ships with node), so an unreported node is not guaranteed
+/// to fail — the build lane degrades to a present manager and logs it.
+/// Excluding every unreported peer would empty the candidate set mid-rollout,
+/// the `retain_dialable` partition lesson.
+///
+/// A reported set admits the node when it has the requested manager OR a
+/// substitute for it. It is never enough to have NEITHER: a build dispatched
+/// there would execute a command that cannot exist, which is precisely the
+/// `/bin/sh: line 1: bun: command not found` failure this gate exists to
+/// prevent. `None` for `manager` (nothing package-manager-shaped was resolved)
+/// admits every node — there is nothing to gate on yet.
+pub fn build_toolchain_capable(n: &NodeInfo, manager: Option<&str>) -> bool {
+    let Some(manager) = manager else {
+        return true;
+    };
+    let Some(have) = n.build_toolchains.as_ref() else {
+        return true;
+    };
+    have.iter().any(|t| t == manager)
+        || crate::resources::package_manager_substitute(manager, have).is_some()
+}
+
+/// Preference rank for `place`'s ordering: a node carrying the EXACT requested
+/// package manager sorts before one that would have to substitute, which sorts
+/// before one that could not run the build at all. Ranking (not filtering) is
+/// what makes "a build that needs bun goes to a node that HAS bun" true without
+/// ever refusing a deploy that would succeed degraded — see
+/// [`build_toolchain_capable`].
+pub fn build_toolchain_rank(n: &NodeInfo, manager: Option<&str>) -> u8 {
+    let Some(manager) = manager else {
+        return 0;
+    };
+    let Some(have) = n.build_toolchains.as_ref() else {
+        return 1; // unreported: unknown, never preferred over a known-capable node
+    };
+    if have.iter().any(|t| t == manager) {
+        0
+    } else if crate::resources::package_manager_substitute(manager, have).is_some() {
+        1
+    } else {
+        2
+    }
+}
+
 /// Repository-controlled commands may run only on nodes whose boot-time live
 /// probe proved the complete BuildExecutor v1 contract. An absent field is an
 /// old node that still builds on the host and is therefore known-incapable.
@@ -305,6 +372,7 @@ fn capable(
     needs_interpreter: InterpreterNeeds,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
+    needs_build_toolchain: Option<&str>,
 ) -> bool {
     if needs_gpu && n.gpu_count == 0 {
         return false;
@@ -323,6 +391,13 @@ fn capable(
         return false;
     }
     if !build_isolation_capable(n, needs_build_isolation) {
+        return false;
+    }
+    // Build-toolchain capability, the same hard-filter shape as the GPU/Wasmer
+    // gates above — a node with neither the requested package manager nor a
+    // substitute cannot run this build at all. See `build_toolchain_capable`
+    // for why an UNREPORTED set is admitted instead of excluded.
+    if !build_toolchain_capable(n, needs_build_toolchain) {
         return false;
     }
     // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
@@ -423,6 +498,7 @@ pub fn dispatch_fallbacks(
     needs_interpreter: impl Into<InterpreterNeeds>,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
+    needs_build_toolchain: Option<&str>,
     exclude: &[String],
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
@@ -469,6 +545,7 @@ pub fn dispatch_fallbacks(
                     needs_interpreter,
                     needs_runtime_artifact,
                     needs_build_isolation,
+                    needs_build_toolchain,
                 )
         })
         .collect();
@@ -479,6 +556,12 @@ pub fn dispatch_fallbacks(
                 dist(a)
                     .partial_cmp(&dist(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            // A fallback must be able to run the build: prefer a node carrying
+            // the exact package manager over one that would substitute.
+            .then_with(|| {
+                build_toolchain_rank(a, needs_build_toolchain)
+                    .cmp(&build_toolchain_rank(b, needs_build_toolchain))
             })
             .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
             .then_with(|| b.disk_free_gb.cmp(&a.disk_free_gb))
@@ -542,6 +625,10 @@ pub fn place(
     // Any repository-controlled command requires the live-probed outer
     // BuildExecutor contract. Old peers and failed probes are ineligible.
     needs_build_isolation: bool,
+    // The package manager this build needs, when known up front (see
+    // `place_for_project`). Ranked as well as filtered, so a bun build lands on
+    // a bun node whenever the fleet has one.
+    needs_build_toolchain: Option<&str>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
     let nodes = cloud.registry.nodes(); // self first
@@ -561,6 +648,7 @@ pub fn place(
             needs_interpreter,
             needs_runtime_artifact,
             needs_build_isolation,
+            needs_build_toolchain,
         )
     };
 
@@ -652,7 +740,13 @@ pub fn place(
             // Order by load, then by MOST free disk. The disk term is what
             // actively drains a filling node instead of merely refusing it
             // once it is already over the floor (Reverse => larger first).
-            pool.sort_by_key(|n| (load_of(&n.name), std::cmp::Reverse(n.disk_free_gb)));
+            pool.sort_by_key(|n| {
+                (
+                    build_toolchain_rank(n, needs_build_toolchain),
+                    load_of(&n.name),
+                    std::cmp::Reverse(n.disk_free_gb),
+                )
+            });
             // Prefer the COORDINATOR itself when it's a valid candidate for this
             // region: a local build has full log fidelity and zero cross-node
             // dispatch/mirror dependency, whereas dispatching to a remote node
@@ -729,6 +823,10 @@ pub fn place(
         dist(a)
             .partial_cmp(&dist(b))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                build_toolchain_rank(a, needs_build_toolchain)
+                    .cmp(&build_toolchain_rank(b, needs_build_toolchain))
+            })
             .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
     });
     // Prefer the coordinator itself when it's eligible: `self` is always the
@@ -745,6 +843,167 @@ pub fn place(
         .find(|n| n.name == me)
         .unwrap_or(elig[0]);
     vec![target_of(chosen)]
+}
+
+/// Why `place` returned NO target for a repository build, for the deploy
+/// refusal message in `git.rs`.
+///
+/// Every count is computed with the SAME predicates `place` filters on
+/// (`build_isolation_capable`, `capable`, `reachable`, `n.healthy`), because
+/// the refusal exists to name the constraint that actually emptied the
+/// candidate set. Counting "nodes that can run a build" while ignoring
+/// health/reachability and the rest of `capable()` is what made a fleet whose
+/// capable nodes were all unreachable read as "8 capable node(s), 5 in your
+/// region(s), and the platform refuses anyway" — pointing the tenant at a
+/// missing BuildExecutor when the real cause was node health.
+#[derive(Debug, Default)]
+pub struct BuildPlacementDiagnosis {
+    /// Nodes known to the mesh that can run repository build commands at all:
+    /// an isolated BuildExecutor v1, or a host-exec mock/litebox backend that
+    /// builds on the host. Fleet-wide; health and region deliberately ignored,
+    /// so this is the "the capability exists somewhere" figure.
+    pub capable_total: usize,
+    /// `capable_total` narrowed to the project's configured region(s); every
+    /// node when the project configures none.
+    pub capable_in_region: usize,
+    /// `capable_in_region` narrowed further to the nodes `place` would
+    /// actually have returned — healthy, reachable and through every other
+    /// `capable()` filter. THIS is the number that explains an empty
+    /// placement.
+    pub placeable_in_region: usize,
+    /// Why the other `capable_in_region` nodes were not placeable, one counted
+    /// reason per entry (`"2 unhealthy"`, `"1 below the 20 GiB placement disk
+    /// floor"`), deterministically ordered.
+    pub blockers: Vec<String>,
+}
+
+/// The FIRST `place` predicate `n` fails, or `None` when `place` would have
+/// accepted it. Checked in the same order `capable`/`place` apply them, so the
+/// refusal names the constraint that actually bit rather than a later one that
+/// also happens to hold.
+fn placement_blocker(
+    cloud: &Arc<CloudState>,
+    n: &NodeInfo,
+    is_container: bool,
+    needs_gpu: bool,
+    needs_interpreter: InterpreterNeeds,
+    needs_runtime_artifact: bool,
+    needs_build_toolchain: Option<&str>,
+) -> Option<String> {
+    if !n.healthy {
+        return Some("unhealthy (its mesh health probe is failing)".to_string());
+    }
+    if !reachable(cloud, n) {
+        return Some(
+            "unreachable from this coordinator (no admin URL and no mesh address)".to_string(),
+        );
+    }
+    if needs_gpu && n.gpu_count == 0 {
+        return Some("no serverless GPU".to_string());
+    }
+    if !wasm_capable(n, needs_interpreter.wasm) {
+        return Some("no wasmer runtime".to_string());
+    }
+    if !bun_capable(n, needs_interpreter.bun) {
+        return Some("no bun runtime".to_string());
+    }
+    if !runtime_artifact_capable(n, needs_runtime_artifact) {
+        return Some("no runtime-artifact v1".to_string());
+    }
+    if let Some(manager) = needs_build_toolchain {
+        if !build_toolchain_capable(n, needs_build_toolchain) {
+            return Some(format!(
+                "cannot run a `{manager}` build (neither that package manager nor a substitute)"
+            ));
+        }
+    }
+    let floor_gb = disk_floor_gb();
+    if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
+        return Some(format!(
+            "below the {floor_gb} GiB placement disk floor ({} GiB free)",
+            n.disk_free_gb
+        ));
+    }
+    if is_container && n.public_ip.is_none() && n.public_ip6.is_none() {
+        return Some(
+            "no public address (a container is served from the node's own host)".to_string(),
+        );
+    }
+    // `capable()`'s tail: a production isolation backend (Firecracker, or
+    // Litebox proving runtime-artifact v1) OR a healthy host-exec mock node —
+    // the healthy half is already established by the check above, so only the
+    // backend string is left to test here.
+    if !eligible(n) && n.backend != "mock" {
+        if n.mem_total_mb < MEM_FLOOR_MB {
+            return Some(format!(
+                "below the {} MiB placement memory floor ({} MiB)",
+                MEM_FLOOR_MB, n.mem_total_mb
+            ));
+        }
+        return Some(format!(
+            "backend \"{}\" is neither an isolation backend nor a host-exec mock node",
+            n.backend
+        ));
+    }
+    None
+}
+
+/// Diagnose a repository-build placement that came back EMPTY: how many nodes
+/// can run repository build commands, how many of those are in the requested
+/// region(s), and — the figure that explains the failure — how many of those
+/// `place` would actually have returned.
+///
+/// `needs_build_isolation` is implied: a repository build is the case being
+/// diagnosed, so every node counted here already passes
+/// [`build_isolation_capable`] (BuildExecutor v1 OR a host-exec
+/// mock/litebox backend).
+pub fn build_placement_diagnosis(
+    cloud: &Arc<CloudState>,
+    regions: &[String],
+    is_container: bool,
+    needs_gpu: bool,
+    needs_interpreter: impl Into<InterpreterNeeds>,
+    needs_runtime_artifact: bool,
+    needs_build_toolchain: Option<&str>,
+) -> BuildPlacementDiagnosis {
+    let needs_interpreter = needs_interpreter.into();
+    let nodes = cloud.registry.nodes();
+    let regions: Vec<String> = regions
+        .iter()
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut diagnosis = BuildPlacementDiagnosis::default();
+    // BTreeMap so the blocker list is ordered identically on every node and in
+    // every retry of the same deploy (the `capable_peers` convention).
+    let mut blockers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for n in nodes.iter() {
+        if !build_isolation_capable(n, true) {
+            continue;
+        }
+        diagnosis.capable_total += 1;
+        if !regions.is_empty() && !regions.iter().any(|r| r.eq_ignore_ascii_case(&n.region)) {
+            continue;
+        }
+        diagnosis.capable_in_region += 1;
+        match placement_blocker(
+            cloud,
+            n,
+            is_container,
+            needs_gpu,
+            needs_interpreter,
+            needs_runtime_artifact,
+            needs_build_toolchain,
+        ) {
+            None => diagnosis.placeable_in_region += 1,
+            Some(reason) => *blockers.entry(reason).or_insert(0) += 1,
+        }
+    }
+    diagnosis.blockers = blockers
+        .into_iter()
+        .map(|(reason, count)| format!("{count} {reason}"))
+        .collect();
+    diagnosis
 }
 
 #[cfg(test)]
@@ -770,6 +1029,7 @@ mod tests {
             // explicitly, the same rule `disk_free_gb` already carries.
             wasm_runtime: None,
             bun_runtime: None,
+            build_toolchains: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             artifact_transfer_protocol: None,

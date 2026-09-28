@@ -151,7 +151,7 @@ const UNIMPLEMENTABLE: &[(&str, &str)] = &[
     ),
 ];
 
-fn unimplementable_lines(source: &str) -> Vec<(usize, &'static str)> {
+pub(crate) fn unimplementable_lines(source: &str) -> Vec<(usize, &'static str)> {
     let mut out = Vec::new();
     for (i, line) in source.lines().enumerate() {
         for (needle, why) in UNIMPLEMENTABLE {
@@ -176,7 +176,7 @@ fn unimplementable_lines(source: &str) -> Vec<(usize, &'static str)> {
 /// The `import.meta` shim the envelope defines when the rewritten entry uses
 /// it: the artifact is ONE in-memory file, so there is no real disk path — the
 /// entry path is reported as it is known to the deployment.
-fn import_meta_binding(entry: &str) -> String {
+pub(crate) fn import_meta_binding(entry: &str) -> String {
     let rel = entry.trim().trim_start_matches("./");
     let esc = rel.replace('\\', "\\\\").replace('"', "\\\"");
     format!(

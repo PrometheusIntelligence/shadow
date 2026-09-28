@@ -4,6 +4,7 @@ import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 import { Space_Grotesk, Electrolize } from "next/font/google";
 import { ClerkProvider } from "@clerk/nextjs";
+import { clerkFrontendOrigin } from "@/lib/clerk-origin.mjs";
 import "./globals.css";
 import { ChromeTop, ChromeBottom } from "@/components/app-chrome";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -124,6 +125,10 @@ export const viewport: Viewport = {
 // Clerk is enabled when a publishable key is present; otherwise the app runs in
 // local mode (no auth) so it still works without keys.
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+// Preconnect target for clerk-js (see the <link> in the tree below). Null
+// whenever no key is configured or its payload isn't a bare hostname, so a
+// malformed env value can never become a URL we emit.
+const clerkOrigin = clerkFrontendOrigin(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);
 
 // Origins Clerk is allowed to redirect back to after sign-in / OAuth — i.e. the
 // app's callback URLs. This lets login work both locally and on the public
@@ -148,6 +153,24 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       suppressHydrationWarning
       className={`${GeistSans.variable} ${GeistMono.variable} ${display.variable} ${electrolize.variable}`}
     >
+      <head>
+        {/* clerk-js is the ONE third-party request on every page's critical
+            path (ClerkProvider loads
+            <origin>/npm/@clerk/clerk-js@5/dist/clerk.browser.js), including the
+            public marketing landing it has nothing to do with. Warm the socket
+            while the HTML is still parsing so that fetch doesn't pay DNS + TCP
+            + TLS first — measured on the fleet, a TLS handshake to a fresh
+            origin costs 60-500 ms, the same order as the landing page's whole
+            TTFB. A real <link> element rather than react-dom's `preconnect()`:
+            that emits an HTTP `Link` header, which only Chrome honours, whereas
+            this tag is honoured by every browser. Deferring clerk-js entirely
+            would mean not mounting ClerkProvider on public routes — a much
+            larger auth-boundary restructure (see the instant=false note above),
+            so this is the cheap half of the win. */}
+        {clerkEnabled && clerkOrigin ? (
+          <link rel="preconnect" href={clerkOrigin} crossOrigin="anonymous" />
+        ) : null}
+      </head>
       <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(STRUCTURED_DATA) }} />
         <PwaRegister />

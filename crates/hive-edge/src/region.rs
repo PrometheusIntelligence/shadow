@@ -232,6 +232,34 @@ pub struct NodeInfo {
     /// forever.
     #[serde(default)]
     pub bun_runtime: Option<bool>,
+    /// Package managers / toolchains this node can ACTUALLY execute in its
+    /// BUILD lane — the filesystem a repository `install`/`build` command execs
+    /// against, which is backend-specific: mock/litebox build as plain HOST
+    /// processes (so this is a host PATH probe), while firecracker builds
+    /// INSIDE the pinned builder image (which this host can neither see nor
+    /// stat, so those nodes report `None`).
+    ///
+    /// Probed at boot and re-probed on the same refresh tick that keeps
+    /// `disk_free_gb` and `wasm_runtime` current, because the fact moves under a
+    /// running process in both directions — a provisioning run installs `bun`,
+    /// a later image/host change removes it. Measured fleet reality when this
+    /// field was added: `bun` present on fc-phoenix and absent on
+    /// fc-virginia and 170.106.158.151, while the build pipeline happily sent
+    /// a `bun install` to all of them and failed with `/bin/sh: line 1: bun:
+    /// command not found`.
+    ///
+    /// `None` = UNREPORTED, and here that means UNKNOWN and is ADMITTED by
+    /// placement — the opposite of `wasm_runtime`/`bun_runtime` directly above,
+    /// where `None` is NOT CAPABLE. The difference is the failure direction: a
+    /// missing package manager HAS a substitute (npm ships with node), so an
+    /// unreported node is not guaranteed to fail and the build lane degrades to
+    /// a present manager with a loud log. Excluding every unreported peer would
+    /// empty the candidate set mid-rollout — the `retain_dialable` partition
+    /// lesson. Names, in canonical probe order (`hive-cloud`'s
+    /// `resources::BUILD_TOOLCHAINS`), never an opaque bit field: an operator
+    /// reading `/v1/nodes` must be able to see `["node","npm"]`.
+    #[serde(default)]
+    pub build_toolchains: Option<Vec<String>>,
     /// Runtime-artifact staging protocol implemented by this node. Source-built
     /// functions require protocol v1 so host static roots and guest workdirs are
     /// interpreted separately and delivery is gated by backend need. `None` is a
@@ -594,24 +622,27 @@ impl NodeRegistry {
         me.gpu_free_mb = gpu_free_mb;
     }
 
-    /// Refresh the three runtime capabilities derived from this node's active
+    /// Refresh the runtime capabilities derived from this node's active
     /// backend and image under one write lock.
     ///
-    /// All three facts move under a running process: a rootfs publication can
-    /// add, remove, or replace its exact proof and Wasmer/Bun markers.
-    /// Publishing them in separate lock acquisitions lets gossip observe a
-    /// tuple that no single backend/image observation produced, so callers
-    /// must always replace the tuple atomically through this method.
+    /// All of these facts move under a running process: a rootfs publication can
+    /// add, remove, or replace its exact proof and Wasmer/Bun markers, and a
+    /// provisioning run can install or remove a build toolchain. Publishing them
+    /// in separate lock acquisitions lets gossip observe a tuple that no single
+    /// backend/image observation produced, so callers must always replace the
+    /// tuple atomically through this method.
     pub fn set_self_runtime_capabilities(
         &self,
         wasm_runtime: Option<bool>,
         bun_runtime: Option<bool>,
         runtime_artifact_protocol: Option<u16>,
+        build_toolchains: Option<Vec<String>>,
     ) {
         let mut me = self.me.write();
         me.wasm_runtime = wasm_runtime;
         me.bun_runtime = bun_runtime;
         me.runtime_artifact_protocol = runtime_artifact_protocol;
+        me.build_toolchains = build_toolchains;
     }
 
     /// Publish (or withdraw) this node's sealed-artifact transfer receiver
@@ -1096,6 +1127,9 @@ impl NodeRegistry {
             if peer.bun_runtime.is_none() {
                 peer.bun_runtime = existing.bun_runtime;
             }
+            if peer.build_toolchains.is_none() {
+                peer.build_toolchains = existing.build_toolchains.clone();
+            }
             if peer.runtime_artifact_protocol.is_none() {
                 peer.runtime_artifact_protocol = existing.runtime_artifact_protocol;
             }
@@ -1161,6 +1195,7 @@ mod tests {
             // not-capable path, which is what a non-Wasmer/non-Bun test node is.
             wasm_runtime: None,
             bun_runtime: None,
+            build_toolchains: None,
             runtime_artifact_protocol: None,
             build_isolation_protocol: None,
             artifact_transfer_protocol: None,

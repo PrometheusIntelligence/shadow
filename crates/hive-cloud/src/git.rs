@@ -1529,6 +1529,369 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     candidates.into_iter().find(|c| build_dir.join(c).is_file())
 }
 
+/// The ONE platform-generated browser entry adapter, and the reservoir it is
+/// derived from. See `assets/browser-adapter.cjs` for the full contract; the
+/// points that bind here:
+///
+/// * It is a CommonJS module assigning `module.exports` to one `async
+///   (request, ops)` function, so it passes `bundle()`'s handler-export gate
+///   for a function that owns no handler-shaped file of its own — no
+///   `api.browser.js` / `browser.js` / `handler.js` / `index.js` / `main.js`,
+///   no `package.json` main/module/exports/scripts.start JS file, and no
+///   framework build output has to be shipped for the function to be served in
+///   donor browsers.
+/// * The server it adapts is EMBEDDED at build time (single-file artifact: a
+///   browser Worker's filesystem holds the artifact and nothing else) and the
+///   remaining candidates are probed with a guarded `require` at runtime, each
+///   miss a skipped attempt rather than a crash. Probe specifiers are
+///   RELATIVE (`./…`) because the artifact's own directory is the `require`
+///   base: a bare specifier resolves through `node_modules`, which a one-file
+///   artifact never has. Nothing adapt-able ⇒ the handler throws a named
+///   `HiveBrowserAdapterError` at the point of use.
+/// * It adds no capability: no host path, no port, no fork, no socket — the
+///   app is invoked with a synthetic request and a collecting response.
+/// * The embedded server is evaluated EXACTLY ONCE (a promise memoized on
+///   `globalThis`, awaited by every invocation): `bundle()` embeds this file
+///   inside the `async function (request, ops)` it exports, so anything at its
+///   top level would otherwise re-run the whole server program per request.
+/// * `require("http")` is answered by a stub that captures the listener AND
+///   answers the rest honestly — `listen()` invokes its callback and emits
+///   `'listening'`, `on/once/emit` are a real registry, `address()` reports
+///   the requested port. A server gated on `await new Promise(r =>
+///   server.listen(0, r))` must complete, not hang.
+/// * `res.statusCode` / `res.statusMessage` are ACCESSORS over the one place
+///   the status lives, so the idiomatic `res.statusCode = 404` reaches the
+///   envelope instead of being dropped for a 200.
+const BROWSER_ADAPTER_JS: &str = include_str!("../assets/browser-adapter.cjs");
+
+/// Platform-reserved name of the generated entry inside a deployment root.
+/// Dot-prefixed and function-suffixed so two functions of one deployment never
+/// collide and a repository file can never be mistaken for it.
+const BROWSER_ADAPTER_FILE_PREFIX: &str = ".hive-browser-entry-";
+const BROWSER_ADAPTER_FILE_SUFFIX: &str = ".cjs";
+
+/// Hard bound on a server source we will embed into the generated adapter.
+/// `bundle()` sizes the whole entry at
+/// `fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES` (256 KiB); the adapter itself
+/// is ~26 KiB, so this leaves real headroom and is checked BEFORE the string
+/// is built rather than discovered as a rejected bundle afterwards.
+const BROWSER_ADAPTER_EMBED_MAX_BYTES: usize = fluid_core::BROWSER_ENTRY_MAX_SOURCE_BYTES
+    - 64 * 1024;
+
+/// The framework server-entry probe table: where a BUILT server actually
+/// lives, in one deterministic order. Deliberately WIDER than
+/// `infer_package_server_entry`'s list — that function only needs to answer
+/// "is there an entry file at all", while this table decides which server the
+/// generated adapter embeds and, failing that, which specifiers it probes at
+/// runtime, so an omitted output here is a deployment that silently serves
+/// nothing in browsers.
+const BROWSER_SERVER_PROBES: &[&str] = &[
+    // Next.js
+    ".next/standalone/server.js",
+    ".next/server/index.js",
+    // Nuxt / Nitro
+    ".output/server/index.mjs",
+    ".output/server/index.js",
+    ".nuxt/dist/server/index.mjs",
+    // SvelteKit
+    ".svelte-kit/output/server/index.js",
+    "build/server/index.js",
+    // Astro / Remix / generic Vite server builds
+    "dist/server/entry.mjs",
+    "dist/server/server.js",
+    "dist/server/index.js",
+    "dist/server/main.js",
+    // Generic compiled/bundled outputs (tsc, esbuild, bun build, swc)
+    "build/index.js",
+    "build/main.js",
+    "build/server.js",
+    "build/app.js",
+    "build/server/main.js",
+    "dist/index.js",
+    "dist/main.js",
+    "dist/server.js",
+    "dist/app.js",
+    "out/index.js",
+    "output/index.js",
+    "server/index.js",
+    "server/main.js",
+    "server.js",
+    "app.js",
+    "main.js",
+    "index.js",
+];
+
+/// A probe/target path as a `require` SPECIFIER: `./`-prefixed and never
+/// absolute. The generated artifact sits at the root of the guest filesystem
+/// the browser substrate mounts (`/hive`, with the artifact's own directory
+/// as its `require` base), so a relative specifier is the only form that can
+/// resolve a sibling file. A BARE specifier (`"server.js"`) resolves through
+/// `node_modules`, which a one-file artifact never has — the bare form made
+/// every runtime probe a guaranteed MODULE_NOT_FOUND, i.e. a dead fallback.
+/// The same string is still a valid build-dir-relative path for locating and
+/// embedding the server, so one list serves both halves.
+fn browser_probe_spec(rel: &str) -> String {
+    let trimmed = rel.trim().trim_start_matches('/');
+    let stripped = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    format!("./{stripped}")
+}
+
+/// [`BROWSER_SERVER_PROBES`] resolved for one function: the function's own
+/// directory first when the manifest names one (Build Output API v3 `.func`
+/// directories), then the deployment root, in the table's order.
+fn browser_server_probe_table(f: &fluid_core::FunctionConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(BROWSER_SERVER_PROBES.len() * 2);
+    if let Some(cwd) = f.cwd_relative.as_deref() {
+        let cwd = cwd.trim().trim_matches('/');
+        if !cwd.is_empty() {
+            for probe in BROWSER_SERVER_PROBES {
+                out.push(browser_probe_spec(&format!("{cwd}/{probe}")));
+            }
+        }
+    }
+    for probe in BROWSER_SERVER_PROBES {
+        out.push(browser_probe_spec(probe));
+    }
+    out
+}
+
+/// Reduce a function name to the `[a-z0-9._-]` shape a generated file name may
+/// carry — the `container_volume_cfg` / `hive-vol-` discipline applied to a
+/// write path: a tenant-controlled string is never interpolated into a path
+/// unsanitized, and the platform prefix is prepended AFTER sanitization.
+fn browser_adapter_file_name(fn_name: &str) -> String {
+    let mut slug = String::with_capacity(fn_name.len() + 32);
+    for ch in fn_name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches(|c| c == '.' || c == '-' || c == '_');
+    format!(
+        "{BROWSER_ADAPTER_FILE_PREFIX}{}{BROWSER_ADAPTER_FILE_SUFFIX}",
+        if slug.is_empty() { "fn" } else { slug }
+    )
+}
+
+/// Generate + stage the platform's browser entry adapter for one Node/Bun
+/// function that owns no handler-shaped entry.
+///
+/// `preferred` is a file inference already located but `bundle()` rejected —
+/// almost always a real server that exports nothing, which is exactly the shape
+/// this adapter exists to host. When it is given it is tried first; otherwise
+/// the probe table decides.
+///
+/// Returns `(entry path, embedded server path)` — the deployment-root-relative
+/// entry path to stamp onto `FunctionConfig::browser`, plus the server the
+/// adapter embedded (so the build log can name it). The file is written
+/// ATOMICALLY (tmp + rename) and read-only (0444), mirroring
+/// `stage_build_output_node_launchers`: the path is platform-reserved, so a
+/// pre-existing symlink there is a refusal and a pre-existing regular file (a
+/// previous pass in the same build dir) is replaced, never followed.
+///
+/// It REFUSES when no server file could be embedded: an entry that adapts
+/// nothing is an artifact that throws in every donor's browser while looking
+/// perfectly bundled.
+fn synthesize_browser_entry(
+    build_dir: &Path,
+    f: &fluid_core::FunctionConfig,
+    preferred: Option<&str>,
+) -> Result<(String, String), String> {
+    let file_name = browser_adapter_file_name(&f.name);
+    let table = browser_server_probe_table(f);
+    let mut candidates: Vec<String> = Vec::with_capacity(table.len() + 1);
+    if let Some(p) = preferred.map(str::trim).filter(|p| !p.is_empty()) {
+        let spec = browser_probe_spec(p);
+        if !candidates.contains(&spec) {
+            candidates.push(spec);
+        }
+    }
+    for probe in &table {
+        if !candidates.iter().any(|c| c == probe) {
+            candidates.push(probe.clone());
+        }
+    }
+
+    // Locate the server to embed. A candidate that cannot be embedded is
+    // recorded and SKIPPED, not fatal — another candidate may embed — but when
+    // NO candidate embeds there is no server to adapt, and the synthesis
+    // refuses (below) rather than shipping an entry that always throws.
+    let mut embedded: Option<(String, String, bool)> = None; // (rel, cjs source, uses_import_meta)
+    let mut skips: Vec<String> = Vec::new();
+    for rel in &candidates {
+        let path = build_dir.join(rel);
+        // Not present is not a skip — the table is a superset of what any one
+        // deployment contains, and a refusal line naming 28 absent paths says
+        // nothing. Only a file that IS there and could not be embedded is
+        // recorded.
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "js" | "mjs" | "cjs") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            skips.push(format!("{rel}: unreadable"));
+            continue;
+        };
+        // Deterministic bytes: LF-normalize before hashing, exactly as
+        // `bundle()` does.
+        let src = raw.replace("\r\n", "\n").replace('\r', "\n");
+        if src.is_empty() || src.len() > BROWSER_ADAPTER_EMBED_MAX_BYTES {
+            skips.push(format!(
+                "{rel}: {} bytes (embeddable range 1..{BROWSER_ADAPTER_EMBED_MAX_BYTES})",
+                src.len()
+            ));
+            continue;
+        }
+        // The unimplementable-surface gate, applied HERE because the embedded
+        // source is what would otherwise ride into the artifact past it:
+        // machine code in a donor's browser is a refusal at build, never a
+        // runtime surprise.
+        let unimplementable = crate::browser_artifacts::unimplementable_lines(&src);
+        if !unimplementable.is_empty() {
+            skips.push(format!(
+                "{rel}: line {} {}",
+                unimplementable[0].0, unimplementable[0].1
+            ));
+            continue;
+        }
+        let Ok(rewritten) = crate::browser_esm::rewrite_esm(&src) else {
+            skips.push(format!("{rel}: module syntax with no CommonJS equivalent"));
+            continue;
+        };
+        embedded = Some((rel.clone(), rewritten.source, rewritten.uses_import_meta));
+        break;
+    }
+
+    // No server located ⇒ REFUSE. An entry embedding nothing still assigns
+    // `module.exports`, so it passes `bundle()`'s handler-export gate, gets a
+    // `browser_artifact` stamped and is auto-served to donors — where every
+    // invocation throws `HiveBrowserAdapterError` and nothing anywhere says
+    // why. The reason names what was looked for, and the auto pass records it
+    // as `browser_ineligible_reason`.
+    let (rel, source, uses_import_meta) = match embedded {
+        Some(found) => found,
+        None => {
+            let mut reason = format!(
+                "no server file in the deployment root to adapt — looked for [{}]",
+                summarize_list(&candidates, 12)
+            );
+            if !skips.is_empty() {
+                reason.push_str(&format!(
+                    "; present but not embeddable [{}]",
+                    summarize_list(&skips, 8)
+                ));
+            }
+            return Err(reason);
+        }
+    };
+    // The name as it is displayed (and as the adapter reports it): the same
+    // path without the `require`-specifier prefix.
+    let embed_name = rel.strip_prefix("./").unwrap_or(&rel).to_string();
+    let embed_block = {
+        let name = embed_name.replace("*/", "* /"); // never close the block comment
+        let meta = if uses_import_meta {
+            crate::browser_artifacts::import_meta_binding(&rel)
+        } else {
+            String::new()
+        };
+        // An ASYNC init function, not a top-level IIFE: `bundle()` embeds this
+        // adapter verbatim inside the `async function (request, ops)` it
+        // exports, so a top-level statement re-evaluates the whole server
+        // program on EVERY invocation (leaking each later instance's app
+        // object, timers and sockets). `__hive_init()` awaits this exactly
+        // once and memoizes the result on `globalThis`. `async` also keeps a
+        // top-level `await` inside a rewritten ES module legal.
+        format!(
+            "async function __hive_embedded_init() {{\n\
+             \x20 const module = {{ exports: {{}} }};\n\
+             \x20 const exports = module.exports;\n\
+             \x20 const require = __hive_require_shim;\n\
+             \x20 {meta}\
+             \x20 /* ---- begin embedded server: {name} ---- */\n\
+             {source}\n\
+             \x20 /* ---- end embedded server ---- */\n\
+             \x20 return module.exports;\n\
+             }}\n",
+            meta = meta,
+            name = name,
+            source = source
+        )
+    };
+    let probes_json = serde_json::to_string(&candidates)
+        .map_err(|e| format!("cannot encode the browser probe table: {e}"))?;
+    // One JSON string literal holding the table's JSON text, so the generated
+    // module is a valid JS file whatever the table contains.
+    let probes_literal = serde_json::to_string(&probes_json)
+        .map_err(|e| format!("cannot encode the browser probe table: {e}"))?;
+    let embed_name_literal = serde_json::to_string(&embed_name)
+        .map_err(|e| format!("cannot encode the embedded entry name: {e}"))?;
+    let text = BROWSER_ADAPTER_JS
+        .replace("__HIVE_EMBED_NAME__", &embed_name_literal)
+        .replace("__HIVE_EMBED_BLOCK__", &embed_block)
+        .replace("__HIVE_PROBES_JSON__", &probes_literal);
+    if text.contains("__HIVE_") {
+        return Err("generated browser entry still carries an unsubstituted placeholder".into());
+    }
+
+    let target = build_dir.join(&file_name);
+    // Reserved-path discipline: a symlink here is a refusal (never followed),
+    // a regular file is this build's own earlier pass and is replaced.
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "the reserved platform browser entry path {file_name:?} is a symlink"
+            ));
+        }
+        Ok(_) => std::fs::remove_file(&target)
+            .map_err(|e| format!("cannot replace {file_name:?}: {e}"))?,
+        Err(_) => {}
+    }
+    let tmp = build_dir.join(format!("{file_name}.tmp"));
+    let written = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &target)?;
+        let mut perms = std::fs::metadata(&target)?.permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot stage {file_name:?}: {e}"));
+    }
+    Ok((file_name, embed_name))
+}
+
+/// A bounded, comma-joined rendering of a list for one log/ refusal line — the
+/// probe table is 30 entries wide and a reason is read by a human, not parsed.
+fn summarize_list(items: &[String], limit: usize) -> String {
+    let mut out = items
+        .iter()
+        .take(limit)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > limit {
+        out.push_str(&format!(", … +{} more", items.len() - limit));
+    }
+    out
+}
+
 /// Every function name a repo's `fluid.json` EXPLICITLY opted into browser
 /// execution, read straight off the raw file.
 ///
@@ -1956,6 +2319,85 @@ fn resolve_build_trust(
     })
 }
 
+/// The ONE `BUILD_ISOLATION_UNAVAILABLE` message, shared by both refusal sites
+/// in `run_build` (the fleet-wide gate and the region-filtered one) so they
+/// cannot drift apart.
+///
+/// It states what the requirement actually is — a node that can run repository
+/// build commands, i.e. an isolated BuildExecutor v1 OR a host-exec
+/// mock/litebox backend that builds on the host (`schedule::
+/// build_isolation_capable`) — instead of "protocol v1" alone, and it keeps the
+/// three counts that used to be conflated separate: capable fleet-wide, capable
+/// in the configured region(s), and (the one that explains an empty placement)
+/// capable AND healthy/reachable there. Printing only the fleet-wide figure
+/// next to "no healthy reachable placement" is what made a fleet whose capable
+/// nodes were all unhealthy read as "capacity exists but the platform refuses",
+/// sending tenants — and us — hunting a missing BuildExecutor on macOS/litebox
+/// nodes that never needed one.
+fn build_isolation_unavailable_message(
+    diagnosis: &crate::schedule::BuildPlacementDiagnosis,
+    regions: &[String],
+) -> String {
+    let requirement = "this source deployment needs a node that can run repository build commands (an isolated BuildExecutor v1, or a host-exec mock/litebox backend that builds on the host), but no healthy reachable placement satisfying the request offers one";
+    // Assembled from single-line pieces on purpose: a `\`-continued Rust
+    // string literal keeps its source indentation, which ships as a run of
+    // spaces mid-sentence in a message users actually read. Pieces that do not
+    // apply are left OUT, never joined as an empty string (a double space reads
+    // as a broken sentence in the build log).
+    let mut sentences: Vec<String> = Vec::new();
+    if diagnosis.capable_total == 0 {
+        // Nothing to count: the fleet has no build-capable node at all.
+    } else if regions.is_empty() {
+        sentences.push(format!(
+            "{} node(s) known to the mesh can run repository build commands, of which {} currently pass placement (healthy, reachable and otherwise eligible).",
+            diagnosis.capable_total, diagnosis.placeable_in_region
+        ));
+    } else {
+        let head = format!(
+            "{} node(s) known to the mesh can run repository build commands; {} of those are in the project's configured region(s) ({})",
+            diagnosis.capable_total,
+            diagnosis.capable_in_region,
+            regions.join(", ")
+        );
+        // With nothing in the configured region(s), the healthy/reachable
+        // figure is 0 by construction — printing it too just repeats the
+        // region count and buries the real reason one clause deeper.
+        if diagnosis.capable_in_region == 0 {
+            sentences.push(format!("{head}."));
+        } else {
+            sentences.push(format!(
+                "{head}, of which {} currently pass placement (healthy, reachable and otherwise eligible).",
+                diagnosis.placeable_in_region
+            ));
+        }
+    }
+    let why = if diagnosis.capable_total == 0 {
+        "No node in the mesh advertises either an isolated BuildExecutor v1 or a host-exec mock/litebox backend, so this is not a health, region or connectivity problem.".to_string()
+    } else if diagnosis.capable_in_region == 0 && !regions.is_empty() {
+        "Every build-capable node is OUTSIDE the project's configured region(s): add a region that has one, or move a build-capable node into one of them.".to_string()
+    } else if diagnosis.placeable_in_region == 0 {
+        let blockers = if diagnosis.blockers.is_empty() {
+            "no per-node reason recorded".to_string()
+        } else {
+            diagnosis.blockers.join("; ")
+        };
+        format!(
+            "The build capability IS present there — what blocks it is node health/connectivity or another placement constraint ({blockers}), not a missing BuildExecutor: check that those nodes are healthy and reachable from the coordinator, or add another region to the project."
+        )
+    } else {
+        format!(
+            "{} node(s) there pass every per-node check, so the empty placement came from a request-level constraint (e.g. a stateful/single-writer deployment is constrained to a single region), not from build capability.",
+            diagnosis.placeable_in_region
+        )
+    };
+    sentences.push(why);
+    sentences.push("No repository-controlled command was run on the host.".to_string());
+    format!(
+        "BUILD_ISOLATION_UNAVAILABLE: {requirement}. {}",
+        sentences.join(" ")
+    )
+}
+
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -2107,6 +2549,15 @@ async fn run_build(
             == Some(hive_core::Runtime::Wasmer);
         let known_bun = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
             == Some(hive_core::Runtime::Bun);
+        // The package manager this build will invoke, when an explicit install
+        // or build command already names one. Known this early only from
+        // Project Settings (vercel.json/fluid.json inside the repo are not read
+        // until checkout) — partial knowledge used honestly, exactly like
+        // `known_wasm`: it can only ever REMOVE an incapable node.
+        let known_build_toolchain = build_toolchain_need(
+            &placement_settings.build.install_command,
+            &placement_settings.build.build_command,
+        );
         let needs_build_isolation = !known_container;
         let targets = crate::schedule::place_for_project(
             cloud,
@@ -2121,20 +2572,29 @@ async fn run_build(
             },
             !known_container,
             needs_build_isolation,
+            known_build_toolchain,
         );
         // Nodes that can run repository build commands: the isolated executor
         // (Firecracker) OR a host-exec backend (mock/litebox) that builds on
         // the host. A fleet with litebox/mock nodes is NOT builder-less.
-        let build_isolation_nodes = cloud
-            .registry
-            .nodes()
-            .into_iter()
-            .filter(|n| {
-                n.build_isolation_protocol == Some(1)
-                    || matches!(n.backend.as_str(), "mock" | "litebox")
-            })
-            .count();
-        if needs_build_isolation && targets.is_empty() && build_isolation_nodes == 0 {
+        // Diagnosed with `place`'s OWN predicates (health, reachability and
+        // every other `capable()` filter), so the refusal can name the
+        // constraint that actually emptied `targets` instead of reporting a
+        // fleet-wide capability count next to the words "healthy reachable
+        // placement".
+        let build_diagnosis = crate::schedule::build_placement_diagnosis(
+            cloud,
+            &regions,
+            known_container,
+            needs_gpu,
+            crate::schedule::InterpreterNeeds {
+                wasm: known_wasm,
+                bun: known_bun,
+            },
+            !known_container,
+            known_build_toolchain,
+        );
+        if needs_build_isolation && targets.is_empty() && build_diagnosis.capable_total == 0 {
             // Refuse EARLY only when project settings already prove a
             // repository-controlled command will run (an explicit
             // install/build command). Everything else proceeds to checkout
@@ -2146,12 +2606,12 @@ async fn run_build(
             let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
                 || !placement_settings.build.build_command.trim().is_empty();
             if explicit_commands {
-                let msg = "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no node advertises build-isolation protocol v1. No repository-controlled command was run on the host.".to_string();
+                let msg = build_isolation_unavailable_message(&build_diagnosis, &regions);
                 log(msg.clone());
                 tracing::warn!(project = %project, "deploy refused: no isolated builder capability");
                 return Err(anyhow::anyhow!(msg));
             }
-            log("No isolated builder capability on this fleet — only zero-command static deploys can succeed; any repository command will be refused.".into());
+            log("No node on this fleet can run repository build commands — only zero-command static deploys can succeed; any repository command will be refused.".into());
         }
         // A GPU deployment must NEVER fall through to this node when placement
         // found no GPU-capable target. Everywhere else an empty `targets` means
@@ -2221,37 +2681,26 @@ async fn run_build(
             let explicit_commands = !placement_settings.build.install_command.trim().is_empty()
                 || !placement_settings.build.build_command.trim().is_empty();
             if explicit_commands {
-                // `build_isolation_nodes` is FLEET-WIDE, but `targets` (the reason
-                // this arm fired) is region-filtered — reporting only the
-                // fleet-wide count reads as "plenty of capacity exists" when the
-                // real problem is that none of it is IN the requested region(s).
-                // Witnessed live: a project pinned to a single region with only
-                // one capable node there kept refusing while the message claimed
-                // 12 capable nodes fleet-wide, giving no signal that the region
-                // pin was the actual constraint.
-                let region_note = if regions.is_empty() {
-                    String::new()
-                } else {
-                    let in_region = cloud
-                        .registry
-                        .nodes()
-                        .into_iter()
-                        .filter(|n| {
-                            regions.iter().any(|r| r == &n.region)
-                                && (n.build_isolation_protocol == Some(1)
-                                    || matches!(n.backend.as_str(), "mock" | "litebox"))
-                        })
-                        .count();
-                    format!(
-                        " Of those, {in_region} are in the project's configured region(s) ({}).",
-                        regions.join(", ")
-                    )
-                };
-                let msg = format!(
-                    "BUILD_ISOLATION_UNAVAILABLE: this source deployment requires an isolated build executor, but no healthy reachable placement satisfying the request advertises build-isolation protocol v1 ({build_isolation_nodes} capable node(s) known to the mesh).{region_note} No repository-controlled command was run on the host."
-                );
+                // The refusal now reports all three counts `place` actually
+                // decided on, not just the fleet-wide one: "capable" (can run
+                // repository build commands at all), "capable in the configured
+                // region(s)", and — the figure that explains THIS arm firing —
+                // "healthy and reachable there". Reporting only the first two
+                // read as "plenty of capacity exists" whether the real problem
+                // was the region pin OR every in-region node being
+                // unhealthy/unreachable, and the latter is exactly what sent a
+                // tenant looking for a BuildExecutor on macOS/litebox nodes
+                // that never needed one.
+                let msg = build_isolation_unavailable_message(&build_diagnosis, &regions);
                 log(msg.clone());
-                tracing::warn!(project = %project, build_isolation_nodes, regions = ?regions, "deploy refused: isolated builder unavailable");
+                tracing::warn!(
+                    project = %project,
+                    capable = build_diagnosis.capable_total,
+                    in_region = build_diagnosis.capable_in_region,
+                    placeable = build_diagnosis.placeable_in_region,
+                    regions = ?regions,
+                    "deploy refused: no placeable node for this repository build"
+                );
                 return Err(anyhow::anyhow!(msg));
             }
         }
@@ -2366,6 +2815,7 @@ async fn run_build(
                         },
                         !known_container,
                         needs_build_isolation,
+                        known_build_toolchain,
                         &names,
                     );
                     let max = dispatch_fallback_max().min(fallbacks.len());
@@ -4296,25 +4746,53 @@ async fn run_build(
             // the same bundle() gate decides whether the source can actually run.
             let entry = infer_browser_entry(&build_dir, &f.name)
                 .or_else(|| infer_package_server_entry(&build_dir));
+            // Nothing handler-shaped and no package/framework entry file:
+            // GENERATE one (browser-auto-generated-entry) instead of refusing.
+            // A Node/Bun server is not ineligible because it exports nothing —
+            // the generated adapter is what turns "a program that binds a port"
+            // into the request→response handler the artifact contract requires.
+            let entry = match entry {
+                Some(entry) => {
+                    log(format!(
+                        "Browser artifact ({}): auto-detected entry {entry:?} — serving in browsers \
+                         automatically (no fluid.json browser opt-in needed).",
+                        f.name
+                    ));
+                    Some(entry)
+                }
+                None => match synthesize_browser_entry(&build_dir, f, None) {
+                    Ok((generated, located)) => {
+                        log(format!(
+                            "Browser artifact ({}): no handler-shaped entry in the deployment root — \
+                             generated {generated:?} to adapt the server it located at {located:?}, \
+                             so this function is served in browsers with no fluid.json browser \
+                             opt-in and no entry file shipped.",
+                            f.name
+                        ));
+                        Some(generated)
+                    }
+                    Err(reason) => {
+                        // Nothing was located, so nothing was stamped: an
+                        // entry that adapts no server is an artifact that
+                        // throws in every donor's browser. The reason names
+                        // what was looked for.
+                        log(format!(
+                            "Browser artifact ({}): not browser-eligible — {reason}",
+                            f.name
+                        ));
+                        tracing::info!(project = %project, function = %f.name, %reason, "auto browser entry not generated (no server to adapt)");
+                        f.browser_ineligible_reason =
+                            Some(format!("could not generate a browser entry — {reason}"));
+                        None
+                    }
+                },
+            };
             if let Some(entry) = entry {
-                log(format!(
-                    "Browser artifact ({}): auto-detected entry {entry:?} — serving in browsers \
-                     automatically (no fluid.json browser opt-in needed).",
-                    f.name
-                ));
                 f.browser = Some(fluid_core::BrowserPolicy {
                     entry,
                     ..Default::default()
                 });
                 auto_browser.insert(f.name.clone());
-            } else {
-                f.browser_ineligible_reason = Some(format!(
-                    "no browser entry found — looked for {}.browser.js, browser.js, {}.js, \
-                     handler.js, index.js, main.js (.mjs/.cjs too), a package.json \
-                     main/module/exports/scripts.start JS file, and the Next.js/SvelteKit \
-                     build outputs in the deployment root",
-                    f.name, f.name
-                ));
             }
         }
     }
@@ -4339,6 +4817,44 @@ async fn run_build(
             }
             let synthesized = auto_browser.contains(&f.name);
             let bundled = match crate::browser_artifacts::bundle(&build_dir, f) {
+                Ok(bundled) => Ok(bundled),
+                Err(reason) => {
+                    // Auto-detected entry that `bundle()`'s gate refused — the
+                    // overwhelmingly common shape is a real server that exports
+                    // no handler at all. That is precisely what the generated
+                    // adapter exists for, so generate it around THIS file and
+                    // retry once rather than declaring the function ineligible.
+                    if !synthesized {
+                        Err(reason)
+                    } else if let Some(preferred) = f.browser.as_ref().map(|p| p.entry.clone()) {
+                        match synthesize_browser_entry(&build_dir, f, Some(&preferred)) {
+                            Ok((generated, located)) => {
+                                log(format!(
+                                    "Browser artifact ({}): the auto-detected entry {preferred:?} \
+                                     does not export a handler ({reason}) — generated {generated:?} \
+                                     to adapt the server it located at {located:?}.",
+                                    f.name
+                                ));
+                                f.browser = Some(fluid_core::BrowserPolicy {
+                                    entry: generated,
+                                    ..Default::default()
+                                });
+                                crate::browser_artifacts::bundle(&build_dir, f).map_err(|second| {
+                                    format!(
+                                        "{reason}; the generated browser entry was rejected too: {second}"
+                                    )
+                                })
+                            }
+                            Err(generate) => Err(format!(
+                                "{reason}; could not generate a browser entry: {generate}"
+                            )),
+                        }
+                    } else {
+                        Err(reason)
+                    }
+                }
+            };
+            let bundled = match bundled {
                 Ok(bundled) => bundled,
                 Err(reason) if synthesized => {
                     // Auto mode never fails the build: the tenant did not opt
@@ -5089,6 +5605,12 @@ async fn run_build(
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
         let needs_gpu = tail_settings.functions.gpu;
+        // Every tail target runs its OWN build, so the toolchain gate applies
+        // here too.
+        let tail_build_toolchain = build_toolchain_need(
+            &tail_settings.build.install_command,
+            &tail_settings.build.build_command,
+        );
         let targets = crate::schedule::place(
             cloud,
             &regions,
@@ -5101,6 +5623,7 @@ async fn run_build(
             },
             true,
             true,
+            tail_build_toolchain,
         );
         if targets
             .iter()
@@ -7141,7 +7664,7 @@ async fn build_via_fdi(
         workspace,
         repository_build,
         foreign_subdir,
-        package_manager,
+        mut package_manager,
         plan,
         build_output,
         vercel_config_present,
@@ -7247,13 +7770,85 @@ async fn build_via_fdi(
         return Ok(manifest);
     }
 
+    // ---- Build toolchain: PROBED, never assumed --------------------------
+    // The plan's resolved package manager may not exist on the filesystem this
+    // build actually execs against — the host PATH for a host-exec backend
+    // (mock/litebox), the inside of the pinned builder image for a microVM one.
+    // Measured when this probe was added: `bun` present on fc-phoenix and
+    // absent on fc-virginia and 170.106.158.151, while the pipeline dispatched a
+    // `bun install` to all three (`/bin/sh: line 1: bun: command not found`).
+    // The probe runs through the SAME session that will run the repository
+    // commands, so its verdict cannot disagree with the command's own
+    // resolution. A build that runs no repository command (a zero-command
+    // static deploy) never pays for it.
+    let steps = &repository_build.contract().steps;
+    let runs_repository_command = !matches!(steps.install, fluid_build::StepAuthority::None)
+        || !matches!(steps.build, fluid_build::StepAuthority::None);
+    let available_toolchains = if runs_repository_command {
+        probe_build_toolchains(&mut isolated, &install_dir, cloud, bid, build_env).await
+    } else {
+        None
+    };
+    // Honest degradation for the DETECTED manager. An absent package manager is
+    // SUBSTITUTED, never executed-and-failed and never silently ignored: npm
+    // ships with node, so a `bun`/`pnpm`/`yarn` plan still installs. Where no
+    // substitute exists the command is left alone and the existing
+    // BUILD_TOOLCHAIN_MISSING classifier names the missing binary — never the
+    // tenant's application.
+    let detected_manager = package_manager.manager;
+    let mut toolchain_substituted = false;
+    if let Some(available) = available_toolchains.as_ref() {
+        if !available.iter().any(|tool| tool == package_manager.manager) {
+            match crate::resources::package_manager_substitute(package_manager.manager, available) {
+                Some(substitute) => {
+                    let requested = package_manager.manager;
+                    log(format!(
+                        "Build toolchain substitution: this repository resolves package manager \
+                         `{requested}` ({:?}), but `{requested}` is absent from this node's build \
+                         environment [{}]. Using `{substitute}` instead — every install/build \
+                         command below runs with `{substitute}`. Provision `{requested}` on this \
+                         node's build filesystem to use it.",
+                        package_manager.source,
+                        available.join(","),
+                    ));
+                    tracing::warn!(
+                        project = %project,
+                        requested, substitute,
+                        available = %available.join(","),
+                        "BUILD_TOOLCHAIN_SUBSTITUTED: resolved package manager absent; degraded to a present one"
+                    );
+                    package_manager.manager = substitute;
+                    // The absent tool's exact version declaration and its
+                    // lockfile kind describe a toolchain that is not here; the
+                    // substitute re-derives its own install arguments.
+                    package_manager.declaration = None;
+                    package_manager.lockfile = None;
+                    toolchain_substituted = true;
+                }
+                None => log(format!(
+                    "WARN: this repository resolves package manager `{}`, which is absent from \
+                     this node's build environment [{}], and no substitute is present — the \
+                     install/build will fail naming it. Provision the toolchain on this node's \
+                     build filesystem.",
+                    package_manager.manager,
+                    available.join(","),
+                )),
+            }
+        }
+    }
+
     let launcher = PackageManagerLauncher::new(&package_manager)?;
 
     log(format!(
-        "Detected framework: {} — primitive: {:?}, package manager: {} ({:?}){}{}",
+        "Detected framework: {} — primitive: {:?}, package manager: {}{} ({:?}){}{}",
         plan.framework.name,
         plan.framework.primitive,
         package_manager.manager,
+        if toolchain_substituted {
+            format!(" — substituted for absent `{}`", detected_manager)
+        } else {
+            String::new()
+        },
         package_manager.source,
         if is_monorepo {
             " (workspace monorepo — installing at root)"
@@ -7269,7 +7864,6 @@ async fn build_via_fdi(
 
     let has_pkg = install_dir.join("package.json").exists();
 
-    let steps = &repository_build.contract().steps;
     log(format!(
         "Repository build snapshot: {} (selected app {}, install root {}, build cwd {}).",
         repository_build.digest(),
@@ -7285,7 +7879,7 @@ async fn build_via_fdi(
             .as_str(),
         repository_build.contract().coordinates.build_cwd.as_str(),
     ));
-    let (install_cmd, use_npm_ci) = match &steps.install {
+    let (mut install_cmd, use_npm_ci) = match &steps.install {
         fluid_build::StepAuthority::None => (None, false),
         fluid_build::StepAuthority::Explicit(command) => {
             (Some(command.as_str().to_string()), false)
@@ -7305,8 +7899,75 @@ async fn build_via_fdi(
             }
         ));
     }
+    // Explicit repository commands are repository authority and otherwise run
+    // byte-for-byte. The ONE exception is a command naming a package manager
+    // this build environment does not have: running it can only ever produce
+    // `/bin/sh: line 1: <tool>: command not found`, so the tool is swapped for
+    // one that IS present and the substitution is logged. Only two shapes are
+    // rewritten, both with a shape the substitute genuinely carries:
+    //   * `<tool> install|i|ci|add …` — manager-specific flags
+    //     (`--frozen-lockfile` is pnpm/bun, `--no-audit` is npm) are NOT
+    //     transplanted; the command is rebuilt for the substitute.
+    //   * `<tool> run <script>` — identical on every manager.
+    // Anything else (a compound shell command, bun-only flags such as
+    // `bun run --bun start`) is left alone, and the existing
+    // BUILD_TOOLCHAIN_MISSING classifier then names the absent binary instead
+    // of blaming the tenant's application.
+    let rewrite_absent_tool = |command: &str| -> Option<(String, &'static str, &'static str)> {
+        let available = available_toolchains.as_ref()?;
+        let requested = command_toolchain(command)?;
+        if available.iter().any(|tool| tool == requested) {
+            return None;
+        }
+        let substitute = crate::resources::package_manager_substitute(requested, available)?;
+        let rest: Vec<&str> = command.split_whitespace().skip(1).collect();
+        let replacement = match rest.first().copied() {
+            Some("install" | "i" | "ci" | "add") => launcher.install(false),
+            Some("run") if rest.len() == 2 => format!("{substitute} run {}", rest[1]),
+            _ => return None,
+        };
+        Some((replacement, requested, substitute))
+    };
+    // Why detection and the executed command can disagree, stated in the build
+    // log: an explicit install command (vercel.json > Project Settings) is
+    // repository authority and overrides detection entirely. Witnessed live —
+    // a redeploy logged `package manager: npm (Default)` and then ran
+    // `bun install`, because the project's own install command named bun.
+    let requested_install_tool = install_cmd.as_deref().and_then(command_toolchain);
+    if let Some((replacement, requested, substitute)) =
+        install_cmd.as_deref().and_then(rewrite_absent_tool)
+    {
+        log(format!(
+            "Build toolchain substitution: the install command names `{requested}` (`{}`), \
+             but `{requested}` is absent from this node's build environment [{}]. Running \
+             `{replacement}` with `{substitute}` instead — the repository's own install \
+             intent is preserved, only the tool it cannot find changes. Provision \
+             `{requested}` on this node's build filesystem to run it as written.",
+            install_cmd.as_deref().unwrap_or_default(),
+            available_toolchains
+                .as_ref()
+                .map(|t| t.join(","))
+                .unwrap_or_default(),
+        ));
+        tracing::warn!(
+            project = %project,
+            requested, substitute,
+            "BUILD_TOOLCHAIN_SUBSTITUTED: explicit install command named an absent package manager"
+        );
+        install_cmd = Some(replacement);
+    }
+    if let Some(requested) = requested_install_tool {
+        if requested != detected_manager {
+            log(format!(
+                "NOTE: repository package-manager detection resolved `{detected_manager}`, but this \
+                 build's install command names `{requested}` — an explicit install command \
+                 (vercel.json > Project Settings) overrides detection, so the two are expected to \
+                 differ and `{requested}` is what runs."
+            ));
+        }
+    }
     let mut turbo_repository_from_app = None;
-    let build_cmd = match &steps.build {
+    let mut build_cmd = match &steps.build {
         fluid_build::StepAuthority::None => None,
         fluid_build::StepAuthority::Explicit(command) => Some(command.as_str().to_string()),
         fluid_build::StepAuthority::Generated(fluid_build::GeneratedStep::RunBuildScript) => {
@@ -7326,6 +7987,27 @@ async fn build_via_fdi(
         }
         _ => anyhow::bail!("repository build snapshot carries an invalid build step"),
     };
+    if let Some((replacement, requested, substitute)) =
+        build_cmd.as_deref().and_then(rewrite_absent_tool)
+    {
+        log(format!(
+            "Build toolchain substitution: the build command names `{requested}` (`{}`), \
+             but `{requested}` is absent from this node's build environment [{}]. Running \
+             `{replacement}` with `{substitute}` instead. Provision `{requested}` on this \
+             node's build filesystem to run it as written.",
+            build_cmd.as_deref().unwrap_or_default(),
+            available_toolchains
+                .as_ref()
+                .map(|t| t.join(","))
+                .unwrap_or_default(),
+        ));
+        tracing::warn!(
+            project = %project,
+            requested, substitute,
+            "BUILD_TOOLCHAIN_SUBSTITUTED: explicit build command named an absent package manager"
+        );
+        build_cmd = Some(replacement);
+    }
     // Host tar extraction/creation would put repository-controlled cache bytes
     // back outside the executor. Do not inspect repository toolchains on the host
     // while isolated cache import/export is disabled; future cache identity must
@@ -9806,6 +10488,68 @@ async fn run_streamed(
         )
         .await
         .map(|_| ())
+}
+
+/// The package manager / toolchain a repository command invokes, when its first
+/// bare word names one. `None` for anything else (a framework binary such as
+/// `next build`, a path-shaped invocation, an empty command) — those are never
+/// substituted, because only a package manager has a drop-in equivalent.
+fn command_toolchain(command: &str) -> Option<&'static str> {
+    let first = command.split_whitespace().next()?;
+    let bit = crate::resources::build_toolchain_bit(first)?;
+    crate::resources::BUILD_TOOLCHAINS
+        .iter()
+        .find(|(_, candidate)| *candidate == bit)
+        .map(|(tool, _)| *tool)
+}
+
+/// The package manager this build needs, from the commands the repository (or
+/// Project Settings) supplies. The install command is consulted first: it runs
+/// before the build command and is the one that died `/bin/sh: line 1: bun:
+/// command not found` on a node with no bun. Deterministic — same inputs, same
+/// answer, on every node.
+fn build_toolchain_need(install_command: &str, build_command: &str) -> Option<&'static str> {
+    command_toolchain(install_command).or_else(|| command_toolchain(build_command))
+}
+
+/// Probe the package managers and toolchains the BUILD LANE can actually exec.
+///
+/// Runs through the very session the repository commands will use — a plain host
+/// process on the host-exec lane (mock/litebox), a shell inside the pinned
+/// builder image on the microVM lane — so the answer is the filesystem the
+/// command resolves against, never the one the daemon happens to see. The
+/// script's exit code is the toolchain bitmask (see
+/// `resources::build_toolchain_probe_script`).
+///
+/// `None` means the probe itself could not run, which callers must read as
+/// UNKNOWN: nothing is substituted and the command runs as written, so this
+/// probe can never turn a working build into a different one.
+async fn probe_build_toolchains(
+    isolated: &mut Option<&mut IsolatedBuild>,
+    dir: &Path,
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<Vec<String>> {
+    let session = require_build_session(isolated).ok()?;
+    let script = crate::resources::build_toolchain_probe_script();
+    let code = session
+        .run(
+            dir,
+            &script,
+            "probe build toolchain",
+            &[],
+            true,
+            cloud,
+            bid,
+            env,
+        )
+        .await
+        .ok()?;
+    if code < 0 {
+        return None;
+    }
+    Some(crate::resources::build_toolchain_names(code as u32))
 }
 
 /// A repository command dying with the shell's 127 has failed on a MISSING
