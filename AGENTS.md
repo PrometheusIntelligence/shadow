@@ -14,8 +14,8 @@ memories/notes whose durable content it absorbed.
   `#[cfg(test)]` modules to verify a change, no assertion/mocking libraries.
   Verify with `cargo test --workspace` plus real live execution.
 - `cargo check` skips `cfg(target_os = "linux")` code AND test targets, so a green
-  local (macOS) check proves nothing about either, and the fleet is all Linux.
-  Run `cargo test --workspace --no-run` before pushing a shared-struct change.
+  local (macOS) check proves nothing about either, and the fleet is all Linux. Run
+  `cargo test --workspace --no-run` before pushing a shared-struct change.
   `0`/`None` on `disk_free_gb`/`gpu_free_mb` mean UNKNOWN.
 - Two glibc build groups: **2.38** = bkk, hk, all five GPU/CVM nodes; **2.39** =
   va/va2/va3/sj/sj2/sp/fr. By OS image, never region. sha256-verify and keep a
@@ -24,7 +24,7 @@ memories/notes whose durable content it absorbed.
   independently — a backend-only roll does NOT ship a `ui/` change; use
   `scripts/deploy-ui-fleet.sh` and verify against the real public domain.
 - Git only through the `gm` skill's git verbs; never raw `git`. zsh treats `path`,
-  `status`, `options`, `cdpath` as special/read-only — never use them as variables.
+  `status`, `options`, `cdpath` as special/read-only.
 - Binary swap: stop → pkill the old PID → verify sha256 → fresh-inode write
   (`cp` then `mv`) → `reset-failed` → start. A bare `mv` + restart crash-loops
   ETXTBSY. `firecracker`/`crun`/`runsc` drift per node — audit on every CVE and
@@ -47,9 +47,9 @@ memories/notes whose durable content it absorbed.
 - Take-over work keys on the ownership TERM (`leadership::TERM_LAPSE`, 30s), not a
   `may_act` edge. An owner present but unable to act is still owner in everyone's
   view, so every job HOLDS fleet-wide — fix by restoring transport or voters,
-  never by weakening the gate.
-- Verify `HIVE_CP_OWNER_CHAIN`/`HIVE_CP_VOTERS` **in the running process**
-  (`/proc/<pid>/environ`, or `launchctl print` on macOS).
+  never by weakening the gate. Verify `HIVE_CP_OWNER_CHAIN`/`HIVE_CP_VOTERS`
+  **in the running process** (`/proc/<pid>/environ`, or `launchctl print` on
+  macOS), since a drop-in or plist overrides the unit file.
 - Node-death self-heal is OFF unless `HIVE_NODE_DEATH_SELF_HEAL=1`. Enabled it
   needs `may_act(NodeDeathRelocate)`, the host absent from `registry.nodes()` for
   10 min measured from this node's first observation (never the row's
@@ -79,37 +79,32 @@ memories/notes whose durable content it absorbed.
   every node agrees on** (`OwnerSource::may_adopt_wholesale_from`): the chain HEAD,
   or on a chain-less mesh the identity election; from a backup chain owner or a
   `Fallback` guess only per-row `MERGE_STORES` are pulled. A failed pull is never
-  silent: `StorePullFailures` WARNs per store and opens a deduped incident every 10
-  consecutive failures. The pull is `store_follower` — its own supervised loops,
-  never behind a GuardianDB or relational await; LARGE (>1 MiB or SUSPECT) stores
-  go one at a time on `store-large-lane`, budgeted by
-  `store_sync::fetch_snapshot`. A critical write must land on EVERY owner-chain
-  candidate, and snapshots must route through `serde_json::Value` with
-  `enc_sorted()` or HashMap-backed stores never byte-match.
+  silent (`StorePullFailures` WARNs per store, incident every 10 failures), and the
+  pull is `store_follower` — its own supervised loops, never behind a GuardianDB
+  await. A critical write must land on EVERY owner-chain candidate, and snapshots
+  must route through `serde_json::Value` with `enc_sorted()`.
 - **The relational index is built by ONE background walker, never on a request
   path, and nothing writes the catalog before it completes once.** An EMPTY
   guardian index makes every `Session` load `Catalog::new()` (every table "does not
   exist", `pg_class`=0) and a `CREATE TABLE IF NOT EXISTS` then overwrites the real
   catalog. `spawn_index_refresher` walks once under
   `HIVE_RELATIONAL_INDEX_BUILD_SECS` (900), re-walks every
-  `HIVE_RELATIONAL_REFRESH_SECS` (120); `index_ready()` gates `init_schema`,
-  `ensure_table_exists` and `backfill_billing_normalize`. Companions: `get`/`scan`
-  fall through to the store's ASYNC `get` (the index is cache-only);
-  `ensure_table_exists` verifies through `information_schema.tables`, never
-  `SELECT 1 FROM t`; `warm_values` warms rows once. Diagnose with
-  `SELECT count(*) FROM pg_catalog.pg_class` via `POST /v1/admin/sql/query` (0 =
-  unbuilt); a follower's state is read from its journal.
+  `HIVE_RELATIONAL_REFRESH_SECS` (120); `index_ready()` gates `init_schema` and
+  `ensure_table_exists`, which verifies through `information_schema.tables`, never
+  `SELECT 1 FROM t`. `get`/`scan` fall through to the store's ASYNC `get`.
+  Diagnose with `SELECT count(*) FROM pg_catalog.pg_class` via
+  `POST /v1/admin/sql/query` (0 = unbuilt); a follower's state is read from its
+  journal.
 - `GET/POST /v1/admin/sql/*` is read-only by construction
   (`reject_unless_readonly` scans the whole query); `known_tables()` (15 today) is
   hand-maintained, and `relational::upsert_billing` wraps a tenant's whole write in
   ONE `BEGIN; … COMMIT;`.
-- **Canonical platform state is one in-memory representation, persisted locally and
-  replicated node-to-node. GuardianDB and its relational SQL mirror must never be
-  an input, a translation layer, or a readiness gate — at most a derived read-only
-  projection.** Fix a failure CLASS once at a shared primitive, never per call
-  site. Cron is NODE-LOCAL and split across nodes — keep it out of store_sync and
-  leader-only execution, and restore it with `CronScheduler::replace_all` (dedups
-  by id), never `add()` in a loop.
+- **GuardianDB and its relational SQL mirror must never be an input, a translation
+  layer, or a readiness gate for canonical platform state — at most a derived
+  read-only projection.** Fix a failure CLASS once at a shared primitive, never
+  per call site. Cron is NODE-LOCAL and split across nodes — keep it out of
+  store_sync and leader-only execution, and restore it with
+  `CronScheduler::replace_all` (dedups by id), never `add()` in a loop.
 
 ## Mesh transport, discovery, watchdogs
 
@@ -127,15 +122,13 @@ memories/notes whose durable content it absorbed.
   unparsed ClientHello to the fleet budget. Connections are also capped per remote
   endpoint (`HIVE_P2P_MAX_CONNS_PER_ENDPOINT`, 16).
 - A refused dial opens a per-endpoint window (1s→30s): `acquire` fails at once with
-  `PeerRefused`, never `DeadPeerTimeout` (which demotes health). A pre-handshake
-  refusal names no identity, so one through a hint's DIRECT addresses opens the
-  window only once an identity-routed path confirms it; a handshake failing
-  `UnknownIssuer` suspends EVERY direct address of that hint for 10 min and retries
-  through the relay — only while the hint HAS a relay entry. Never let an address
-  filter empty the set.
-- A gossip response body is read against IDLE, not a first-byte deadline
-  (`read_response_frame`: `HIVE_P2P_FIRSTBYTE_MS` 15s then `HIVE_P2P_IDLE_MS` 45s);
-  replies ≥256 KiB go at lower stream priority.
+  `PeerRefused`, never `DeadPeerTimeout`. A pre-handshake refusal names no
+  identity, so one through a hint's DIRECT addresses opens the window only once an
+  identity-routed path confirms it; `UnknownIssuer` suspends EVERY direct address
+  of that hint for 10 min and retries via the relay — only while the hint HAS one.
+  Never let an address filter empty the set. Gossip bodies are read against IDLE
+  (`HIVE_P2P_FIRSTBYTE_MS` 15s then `HIVE_P2P_IDLE_MS` 45s), and replies ≥256 KiB
+  go at lower stream priority.
 - `hive_p2p::establish_stats` is served on operator-only `GET /v1/mesh/establish`,
   **never on the unauthenticated `/v1/mesh`**. `last_outbound_established_ms`
   frozen while dials time out and warm trunks still gossip IS the wedge;
@@ -143,8 +136,8 @@ memories/notes whose durable content it absorbed.
 - Keep the vendored iroh "read before send" patch across pin bumps (`vendor/` is
   synced by the fanout role — edit vendored crates only between rolls);
   `Dropping received relay packet: no available capacity` on a NON-leader is a new
-  finding. A failed rebind must be RETRIED (`PendingRebind`), since netwatch
-  closes the old socket first and `AddrInUse` leaves the transport Closed.
+  finding. A failed rebind must be RETRIED (`PendingRebind`), since netwatch closes
+  the old socket first and `AddrInUse` leaves the transport Closed.
 - Address lookup: every source except the public DHT presupposes reachability, so
   `hive_p2p::dht` stays registered and every failure path leaves it UNREGISTERED
   with a WARN, never failing `bind()`. Never hand `DhtBuilder` a hostname. DHT
@@ -155,28 +148,25 @@ memories/notes whose durable content it absorbed.
   peer's gossiped `iroh_addr`, steering via `hive_edge::select_relay_hint` only
   when the addr has none. `NodeInfo::relay_url` (`http://<public-ip>:3341`) is
   TCP-dead across Tencent hosts; `https://*.relay.shadw.app:3343` answers from
-  every vantage. Diagnose a sick pair from THREE vantages.
+  every vantage.
 - **A gossip round never waits on a dead peer, and one stale reading never
   withdraws one.** Rounds end at `HIVE_GOSSIP_ROUND_DEADLINE_MS` (8000) using ONE
   fan-out primitive, `bounded_round::BoundedRound`, never a hand-rolled
   `join_all`. A slow sync is LATE, never absent (`round_contributions`); backoff
-  applies only while this node's view is fresh (`gossip_round::VIEW_FRESH_MS` 60s);
-  `health::demote` withdraws only after `DEMOTE_STALE_ROUNDS` (2) stale rounds and
-  HOLDS while the loop has stopped ending rounds.
+  applies only while this node's view is fresh; `health::demote` withdraws only
+  after `DEMOTE_STALE_ROUNDS` (2) stale rounds and HOLDS while the loop is stalled.
 - meshwatch: total isolation (600s), cumulative degradation, and
-  `establishment_wedge` — which reads transport counters, never peer counts. Its
-  evidence must be unforgeable: no fresh connection in either direction for
-  `HIVE_MESH_ESTABLISH_WEDGE_SECS` (300) while dials to ≥2 distinct peers TIMED
-  OUT, or ≥3 accepts closed at the deadline with zero successful accepts. A refusal
-  does not count; stuck accepts alone only WARN; each trigger carries a per-node
-  FNV stagger (0–10 min).
+  `establishment_wedge` — which reads transport counters, never peer counts: no
+  fresh connection in either direction for `HIVE_MESH_ESTABLISH_WEDGE_SECS` (300)
+  while dials to ≥2 distinct peers TIMED OUT, or ≥3 accepts closed at the deadline
+  with zero successful accepts. A refusal does not count; stuck accepts alone only
+  WARN; triggers carry a per-node FNV stagger (0–10 min).
 - **Every automatic restart passes ONE chokepoint, `ControlledRestart::request` →
   `RestartReason::admissible`**: refused until `hive_backend::orphan_reap_ran()`
   confirms this boot's cell reap (false on macOS and with
   `HIVE_CELL_ORPHAN_REAP=0`, so those nodes only WARN) and rate-capped per reason
-  (wedge 1 per 6h). The reason is stamped into the run marker so
-  `restart_history.json` carries it, and the cap counted from it fails CLOSED when
-  that history is unreadable.
+  (wedge 1 per 6h), with the reason stamped into the run marker so the cap counted
+  from `restart_history.json` fails CLOSED when it is unreadable.
 
 ## Node bring-up, health, host firewall
 
@@ -187,18 +177,15 @@ memories/notes whose durable content it absorbed.
   must every existing node's. Join rides a dedicated `STREAM_JOIN` mode
   authenticated by the QUIC remote id plus an HMAC over `HIVE_JWT_SECRET`.
 - A health verdict is PER-OBSERVER, and the verdict that decides traffic is the
-  leader's. A successful cross-continent probe measured 7462ms, so too low a
-  `HIVE_HEALTH_TIMEOUT` manufactures unhealthy peers; never trust a TCP probe from
-  a laptop on the VPN (it SYN-proxies).
+  leader's. A successful cross-continent probe measured 7462ms; never trust a TCP
+  probe from a laptop on the VPN (it SYN-proxies).
 - **The published-port range (TCP+UDP 20000–29999) is SG-open to the internet on
-  every platform host**, so any wildcard listener there is world-reachable — never
-  run an ad-hoc file server on a fleet node. `scripts/audit-public-listeners.sh`
-  is the check (exits 1 on a finding).
+  every platform host** — never run an ad-hoc file server on a fleet node.
+  `scripts/audit-public-listeners.sh` is the check (exits 1 on a finding).
 - `scripts/hive-lockdown.sh` is the fleet's only host firewall and its PEERS roster
   is generated (`scripts/gen-hive-lockdown.sh` then
   `ansible-playbook playbooks/site.yml --tags lockdown`), never typed. Do not gate
-  the published range on the listener's cgroup — a listener SYN has no socket
-  attached when the match runs.
+  the published range on the listener's cgroup.
 
 ## Containers, podman locks, process lifecycle
 
@@ -221,17 +208,17 @@ memories/notes whose durable content it absorbed.
   `flush_blocking` closed admission is REFUSED, never blocked (a condvar wait there
   parks a tokio worker and can kill every timer, the shutdown deadline included);
   `HIVE_SHUTDOWN_DEADLINE_SECS` (75) lives on a std thread; `TimeoutStopSec=90s`
-  is explicit (TencentOS defaults it to 5s); the guardian wait is 10s per step.
-- podman allocates one lock from a **fixed pool** (2048) per CONTAINER and per
-  VOLUME — leaked locks starve the whole node and surface as 503
-  `CAPACITY_EXHAUSTED`. Any path that removes a container must pass `-v`
-  (`container_cli::rm_args`). **Never `podman volume prune`** — reclaim is gated
-  on `is_anonymous_volume` (exactly 64 ascii-hex) AND `dangling=true`.
+  is explicit (TencentOS defaults it to 5s). Any path that removes a container must
+  pass `-v` (`container_cli::rm_args`), since podman allocates one lock from a
+  **fixed pool** (2048) per CONTAINER and per VOLUME — leaked locks starve the
+  whole node and surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume
+  prune`** — reclaim is gated on `is_anonymous_volume` (exactly 64 ascii-hex) AND
+  `dangling=true`.
 - macOS launchd: non-demand spawns are pended indefinitely on a long-uptime gui
   domain, so a watchdog must be a PERSISTENT loop (`WATCHDOG_LOOP=1`) plus one
   manual `launchctl kickstart`; after `bootout`, `bootstrap` often fails
-  "Input/output error" — retry then `load -w`. `kickstart -k` alone does NOT
-  re-read a plist; verify env with `launchctl print gui/$UID/<label>`.
+  "Input/output error" — retry then `load -w`. `kickstart -k` does NOT re-read a
+  plist.
 
 ## Isolation backends & capability gating
 
@@ -242,13 +229,12 @@ memories/notes whose durable content it absorbed.
   (probe script inside the builder image for firecracker, host PATH otherwise).
   `None` means NOT CAPABLE, unlike `disk_free_gb == 0`. Placement gates through ONE
   predicate shared by `place`, lease-stickiness and `dispatch_fallbacks`
-  (`schedule::wasm_capable`, `bun_capable`, `build_isolation_capable`), and a
-  missing runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
-- BUILD-ENV bun and GUEST/RUNTIME bun are independent: a bun PACKAGE-MANAGER
-  choice must NOT gate on `bun_runtime`, and a package manager the manifest selects
-  but the node lacks is substituted (npm first) with a loud log. Exit 127/42 of an
-  explicit repository command maps to typed `BUILD_TOOLCHAIN_MISSING`/`MISMATCH` —
-  a platform fault, not a tenant failure.
+  (`schedule::wasm_capable`, `bun_capable`, `build_isolation_capable`); a missing
+  runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
+- BUILD-ENV bun and GUEST/RUNTIME bun are independent: a bun PACKAGE-MANAGER choice
+  must NOT gate on `bun_runtime`, and a package manager the manifest selects but
+  the node lacks is substituted (npm first) with a loud log. Exit 127/42 of an
+  explicit repository command maps to typed `BUILD_TOOLCHAIN_MISSING`/`MISMATCH`.
 - PVM kernels: `pti=off` is REQUIRED or `kvm_pvm` refuses to load and `/dev/kvm`
   disappears; `make install` RESETS grubby args. **`KVM_CREATE_VM` succeeding does
   NOT mean microVMs work** — booting one can hard-reset the host
@@ -257,21 +243,18 @@ memories/notes whose durable content it absorbed.
 - Litebox (third `CellBackend`, Firecracker → Litebox → Mock): a node is Litebox
   only after `hive-cloud --litebox-probe` PASSES on that host with the exact staged
   runner AND `litebox_verified=true` on its inventory line — never the flag alone,
-  never on macOS. The guest filesystem is a fully separate explicitly-populated
-  tree staged via `--initial-files=<tar>` with `tar -h`. Security posture is
-  honest: seccomp-bpf beats Mock, but guest and enforcement share one address space
-  and JIT-generated syscalls are an unclosed gap — never substitute it for
-  Firecracker capability. Load-bearing details:
+  never on macOS. The guest tree is staged via `--initial-files=<tar>` with
+  `tar -h`. Security posture is honest: seccomp-bpf beats Mock, but guest and
+  enforcement share one address space and JIT-generated syscalls are an unclosed
+  gap — never substitute it for Firecracker capability. Details:
   - A guest child must `execve` immediately: `fork()` hands the child pointers
     into the PARENT's mapping, so pipelines/subshells abort — hence the shell rc's
-    fork-free `command -v` DEBUG trap (`litebox-shellrc.sh`).
-  - A sandbox shell STARTS with stderr off the pty and moves it there itself:
-    litebox has no job-control tty ioctls and a shell whose stderr IS the pty dies
-    `exit_group(277)`; the stderr pipe is pumped as RAW CHUNKS.
+    fork-free `command -v` DEBUG trap (`litebox-shellrc.sh`). A sandbox shell
+    STARTS with stderr off the pty (no job-control tty ioctls; stderr on the pty
+    dies `exit_group(277)`) and the pipe is pumped as RAW CHUNKS.
   - A TUN device has ONE owner: each exec/shell runner takes its own
     `allocate_link()` and moves the ARMED `LiteboxLinkRollback` into the waiter
-    task — same rule for the guest tar and its alias, opened by the runner after
-    spawn, so both belong to the WAITER, not the spawner.
+    task — same rule for the guest tar and its alias, opened after spawn.
   - Every exec drain runs in its own task under a deadline
     (`HIVE_SANDBOX_RUN_MS` −10s blocking; `timeout_ms` capped by
     `HIVE_SANDBOX_EXEC_MAX_MS`); `LiteboxBackend::terminate` kills every exec and
@@ -287,60 +270,46 @@ memories/notes whose durable content it absorbed.
   `schedule::dispatch_fallbacks` one candidate at a time with the same `capable` +
   `reachable` predicates as `place` (never the region widening), bounded by
   `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3), stopping when any node RAN it.
-  `node_admins` holds http(s):// URLs only — a 64-hex id there makes every
-  dispatch a reqwest "builder error".
+  `node_admins` holds http(s):// URLs only.
 - Isolated BuildExecutor (`build_executor.rs`): `HIVE_BUILDAH_SOCKET` is NOT in PID
   1's environ — only the tenant process carries it, so recover it by scanning
   `/proc/<pid>/environ`; `/run/lock` needs its own mode=1777 tmpfs; use
-  `--isolation=chroot`. This image's `curl` rejects `--opt=value` — split options
-  into two argv entries, or a probe exits 2 on a usage error and never sends a
-  packet. The builder entry init requires the exact 11-cap set with
+  `--isolation=chroot`; this image's `curl` rejects `--opt=value`, so split options
+  into two argv entries. The builder entry init requires the exact 11-cap set with
   `no_new_privs==0` and drops tenant caps itself, so blanket `--cap-drop=all`
   cannot pass; the archive pin is all-or-nothing fail-closed. **Do not flip
-  `build_isolation_protocol` to `Some(v1)`** (main.rs hard-codes `None`):
-  `schedule::build_isolation_capable()` already admits protocol v1 OR
-  {mock, litebox}, and advertising v1 on firecracker could send untrusted
-  repository commands down a non-isolated path.
+  `build_isolation_protocol` to `Some(v1)`** (main.rs hard-codes `None`).
 - Checkouts live in the DURABLE root `git::deploy_root()` (`$HIVE_DATA/deploys`);
   prefix scanners must cover BOTH roots and BOTH name forms via
-  `git::checkout_prefixes`. ZIP extraction is a bounded descriptor-relative
-  importer that REJECTS symlinks and directory entries.
-- A direct-entry function whose entry does not exist fails the BUILD, never the
-  launch and never as a node fault (`git::preflight_direct_entries`). The
-  `fluid.json` lane ships the checkout AS-IS — `produce_manifest` runs no
-  install/build. Redeploy of `upload://`/`image://` sources resolves the
-  UNFILTERED newest source (`source_for_project_fleet`).
+  `git::checkout_prefixes`. ZIP extraction REJECTS symlinks and directory entries.
+  A direct-entry function whose entry does not exist fails the BUILD, never the
+  launch and never as a node fault (`git::preflight_direct_entries`).
 - The relocation reaper is SCOPED: `cleanup_non_targets` runs only for builds
   provably classified PRODUCTION and removes ONLY superseded production-lane
   records via `/v1/projects/<p>/reap-deployments`. ProjectSettings rows replicate
   with per-row `updated_ms` + permanent tombstones; merges never let absence erase
-  a row. A preview's URL is `commit_alias || branch_alias || id_alias`.
-- The deployment ledger's checksum is verified over the payload bytes AS STORED
-  (`Box<RawValue>`), never over a re-serialization — a new `#[serde(default)]`
-  field otherwise fails every ledger closed. A ledger rewritten with
-  `integrity_chain` fails a binary that predates it: never roll a node back past it.
+  a row. A preview's URL is `commit_alias || branch_alias || id_alias`, and the
+  ledger's checksum is verified over the payload bytes AS STORED
+  (`Box<RawValue>`), never over a re-serialization.
 
 ## Placement & capacity
 
 - Disk is a HARD filter, not a score term (`HIVE_PLACEMENT_DISK_FLOOR_GB`, set
-  above the per-cold-start floor so admission does not defer the failure and blame
-  the tenant). `NodeInfo::disk_free_gb` is gossiped and refreshed on a timer;
-  unknown (`0`) must ADMIT.
-- GPU: container path only; gpu deployments are eligible only on nodes with
-  `NodeInfo::gpu_count > 0`, including the lease-stickiness path, with no silent
-  CPU fallback. Free VRAM comes from the driver (`gpu_free_mb`) and the pool takes
-  the MINIMUM of measured and estimated. No `--split-mode tensor` on T4;
-  cross-node pooling is `--rpc` pipeline-parallel. Managed inference elects its
-  coordinator deterministically (FNV(project) over the sorted GPU roster of the
-  largest-VRAM region); the app reads `HIVE_INFERENCE_URL`. llama.cpp rebuilds stay
-  on CUDA 12.x.
-- Per-deployment data images carry a DOUBLE prefix (`dpl-dpl-<hash>.data.ext4`),
-  so a GC keep-set built from raw deployment ids matches nothing on disk.
-  `gc_rootfs_images` matches both forms and refuses an empty keep-set or an
-  orphaned fraction over `HIVE_GC_MAX_REAP_FRACTION`. **Every reclaim path needs
-  the same blast-radius guard** — the same shape guards `browser_artifacts::gc`,
-  `browser_db` replica GC and the guardian reaper (which also refuses when
-  `HIVE_NODE_ROSTER` is unset).
+  above the per-cold-start floor). `NodeInfo::disk_free_gb` is gossiped and
+  refreshed on a timer; unknown (`0`) must ADMIT.
+- GPU: container path only; eligible only on `NodeInfo::gpu_count > 0` nodes,
+  including the lease-stickiness path, with no silent CPU fallback. Free VRAM
+  comes from the driver (`gpu_free_mb`) and the pool takes the MINIMUM of measured
+  and estimated. No `--split-mode tensor` on T4; cross-node pooling is `--rpc`.
+  Managed inference elects its coordinator deterministically (FNV(project) over the
+  sorted GPU roster); the app reads `HIVE_INFERENCE_URL`. llama.cpp stays on CUDA
+  12.x.
+- Data images carry a DOUBLE prefix (`dpl-dpl-<hash>.data.ext4`), so a GC keep-set
+  built from raw deployment ids matches nothing. `gc_rootfs_images` matches both
+  forms and refuses an empty keep-set or an orphaned fraction over
+  `HIVE_GC_MAX_REAP_FRACTION`. **Every reclaim path needs the same blast-radius
+  guard** — the same shape guards `browser_artifacts::gc`, `browser_db` GC and the
+  guardian reaper (which also refuses when `HIVE_NODE_ROSTER` is unset).
 
 ## Request-path failure invariants
 
@@ -348,35 +317,31 @@ memories/notes whose durable content it absorbed.
   (`crash_streak` + `last_warm_ok_ms`) or never listens (`warm_fail_streak`).
   Never clear a streak merely because a start succeeded; only surviving
   `CRASH_LOOP_WINDOW_MS` counts as healthy, and both the autoscaler AND the
-  request path must record failures (a `min_instances=0` pool is never warmed).
+  request path must record failures.
 - A broken deployment reports `DEPLOYMENT_CIRCUIT_OPEN`, never
-  `CAPACITY_EXHAUSTED` — `classify_lease_error`'s else arm otherwise blames the
-  host for an app fault. A circuit's open window (`CIRCUIT_PROBE_INTERVAL_MS`)
-  must outlast the failure it guards.
+  `CAPACITY_EXHAUSTED`. A circuit's open window (`CIRCUIT_PROBE_INTERVAL_MS`) must
+  outlast the failure it guards.
 - **Anything a request path reserves must be released by a `Drop` guard, never
-  only on the `Err` branch** — axum DROPS the request future when a client gives
-  up and a dropped future never returns `Err`. `ColdStartGuard` is the pattern; it
+  only on the `Err` branch** — axum DROPS the request future when a client gives up
+  and a dropped future never returns `Err`. `ColdStartGuard` is the pattern; it
   applies to `PooledConn`, litebox guest tars/links and sandbox exec drains. Count
   failure streaks at the ONE chokepoint every caller funnels through.
 - Tenant tier lives in BOTH `c.teams` and `c.billing`; neither is authoritative
   alone, so **every tier change goes through `admin::apply_plan_everywhere`** and
-  deletion clears both (`team_delete`, keeping the ledger). `teams.set_plan`
-  returning `None` is normal for personal namespaces.
+  deletion clears both (`team_delete`, keeping the ledger).
 
 ## Managed data lanes
 
-- **Managed SQLite (`DbKind::Sqlite`) and `browser_db` share nothing but the
-  word** — a plain file per DATABASE at
+- **Managed SQLite (`DbKind::Sqlite`) and `browser_db` share nothing but the word**
+  — a plain file per DATABASE at
   `$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db` vs a cr-sqlite CRR
   replica per PROJECT at
-  `$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db`. **Never
-  point the Hrana handler at a `browser-dbs` file** — a bare `rusqlite` writer
+  `$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db`. **Never point
+  the Hrana handler at a `browser-dbs` file** — a bare `rusqlite` writer
   (`sqlite_pool`) bypasses the clock tables the CRR merge reads, i.e. silent
   permanent divergence; `browser_db_rest` is CRR-safe only because it opens via
-  `hive_crsql::open` and applies `set_ts`. Platform-issued ids are proven
-  `db_` + 8..=64 lowercase hex before becoming path components, and the SQLite lane
-  is owner-routed, never leader-routed (`hrana::forward_to_owner` /
-  `hrana-mesh`): the owner re-checks the bearer and refuses to re-proxy, so an
+  `hive_crsql::open` and applies `set_ts`. The SQLite lane is owner-routed, never
+  leader-routed: the owner re-checks the bearer and refuses to re-proxy, so an
   unreachable owner is an honest 421.
 - SQLite wire: `integer`/`last_insert_rowid` are STRINGS, `blob` is base64 WITH
   padding, a non-finite float is a loud error, EVERY request in a pipeline runs
@@ -386,37 +351,22 @@ memories/notes whose durable content it absorbed.
   scope read-only, only with `public_read`); caps bind BOTH sides (`max_bytes`
   64 MiB, `max_value_bytes` 1 MiB) and over-cap is a typed refusal + whole-batch
   rollback — never truncate or evict. Bytes/site-ids/watermarks replicate ONLY
-  through `hive_crsql` ChangeBatch (`Op::CrrSync`, 4 MiB
-  `BROWSER_MAX_CRR_FRAME`), and the fleet re-checks the grant on EVERY request
-  against its own admission view, deriving tenant+project+file server-side, so
-  `db_file` is an identifier, never a path. cr-sqlite v0.17 does not replicate
-  schema, so both halves derive it from the spec's DDL + `crsql_as_crr`.
-  `HIVE_CRSQL_EXTENSION_PATH` must point at the packaged
-  `/var/lib/hive/crsqlite.so` (the deploy syncs only `crates/`). Read-only
-  sessions are enforced by a comment-aware statement-class denylist plus refusing
-  `sequence`; `max_bytes` is measured AFTER the RESERVED lock.
-- Managed Supabase Studio: a self-contained per-database mini-stack (postgres +
-  postgres-meta + studio, no Kong), named volume, static HS256 JWTs,
-  reconcile-loop self-healing.
-
-## Browser lane
-
-- `fluid_core::browser_policy_digest` and `policyDigest` in
-  `crates/hive-browser/www/function-runtime.js` are ONE contract with TWO
-  implementations — drift silently breaks every artifact pin. Same for
-  `val_payload_bytes` (hive-crsql and `hcb1.js`). A browser function is eligible
-  only by explicit fluid.json opt-in (which FAILS THE BUILD when ineligible —
-  never warn-and-drop) or build-time auto-detection; static ESM syntax is
-  REWRITTEN to CommonJS (`browser_esm.rs`), never rejected.
+  through `hive_crsql` ChangeBatch (`Op::CrrSync`), and the fleet re-checks the
+  grant on EVERY request against its own admission view, deriving
+  tenant+project+file server-side, so `db_file` is an identifier, never a path.
+  cr-sqlite v0.17 does not replicate schema, so both halves derive it from the
+  spec's DDL + `crsql_as_crr`. `HIVE_CRSQL_EXTENSION_PATH` must point at the
+  packaged `/var/lib/hive/crsqlite.so`; read-only sessions are enforced by a
+  comment-aware statement-class denylist plus refusing `sequence`.
+- `browser_db`: grants ride the admission
 - Bytes stay node-local (`$HIVE_DATA/browser-artifacts/<policy_digest>.js`); only
-  descriptor metadata replicates, and delivery re-verifies size and source BLAKE3
-  before serving, 404 for a foreign tenant, digest validated as 64 lowercase hex
-  before it becomes a path component. Admission capabilities are entirely
-  server-derived: `AdmissionRequest.digest` is accepted but never read (a forged
-  digest admits nothing), `trusted_callers` comes from the live HEALTHY registry,
-  and `serve_mode` is a request, never a capability.
+  descriptor metadata replicates, delivery re-verifies size and source BLAKE3
+  before serving (404 for a foreign tenant), and admission capabilities are
+  entirely server-derived — `AdmissionRequest.digest` is accepted but never read,
+  `trusted_callers` comes from the live HEALTHY registry, and `serve_mode` is a
+  request, never a capability.
 - COOP/COEP: the default is `HIVE_COI=lane` (global `require-corp` breaks the
-  dashboard's Clerk embed and every tenant hotlinking a CORP-less asset) and
+  dashboard's Clerk embed and tenants hotlinking CORP-less assets) and
   `HIVE_COI_COEP=credentialless` (Safari implements neither value). `coi::layer`
   on the public listener is the ONLY writer. Isolation is DETECTED
   (`crossOriginIsolated`) and its absence is REPORTED, never waited out.
@@ -429,33 +379,30 @@ memories/notes whose durable content it absorbed.
   name must never serve NEITHER addresses NOR delegation** — Vercel refuses NS
   creation while any child record exists, so every cutover runs as a
   restore-on-failure transaction in `vercel_dns::plan_writes` (creates before
-  deletes), rollbacks are VERIFIED, and `ReconcileGuards`' create circuit skips
-  delete-first steps while creates are broken. `alarm_dark_names` ends every pass
-  by alarming a managed name projected empty. `VercelApi::list()` MUST paginate
-  (100/page, `until` cursor): a truncated listing makes the diff re-create
-  invisible records and read absence as deletion authority.
+  deletes) with VERIFIED rollbacks, and `ReconcileGuards`' create circuit skips
+  delete-first steps while creates are broken. `VercelApi::list()` MUST paginate
+  (100/page, `until` cursor) or the diff re-creates invisible records and reads
+  absence as deletion authority.
 - **Advertise only what peers have PROVEN**: `NodeInfo::dns_ns` is necessary and
   never sufficient, so `dns_probe` (every node) proves reachability and
   `validate_nameservers` admits only a node attested from TWO distinct REGIONS,
   never self-attesting. Below two proven nameservers the reconciler HOLDS the
-  published NS set rather than withdrawing (deleting every NS would blackhole the
-  zone) and opens an incident. `publishable()` is damped both ways; the ACME
-  orphan sweeper runs every pass (an unknown `_acme-challenge.*` TXT older than 15
-  min is deleted; unknown age means KEEP); LE rate limits are incidents.
+  published NS set rather than withdrawing and opens an incident. `publishable()`
+  is damped both ways; the ACME orphan sweeper runs every pass (unknown
+  `_acme-challenge.*` TXT older than 15 min is deleted; unknown age means KEEP).
   **Gotcha:** `dns_ns`/`dns_api` derive from `HIVE_DNS_ADDR` ONLY when its host is
   a wildcard — binding Seer to a specific IP silently drops the node from the NS
-  set even though it still answers. **Gotcha:** on Tencent CVMs the "public" IP is
-  1:1 NAT and is on NO interface, so narrowing a bind to it takes the service down;
-  where aardvark-dns needs the wildcard `:53` released, bind the PRIVATE IP. Name
-  drop-ins to sort AFTER the file they override (digits sort before letters).
+  set. **Gotcha:** on Tencent CVMs the "public" IP is 1:1 NAT and is on NO
+  interface; where aardvark-dns needs the wildcard `:53` released, bind the
+  PRIVATE IP. Name drop-ins to sort AFTER the file they override.
 - Geo tailoring locates by EDNS Client Subnet else source address; the primary
   source is the LOCAL committed table (`crates/hive-cloud/assets/geoloc.bin`) so no
   third party sees a client prefix, and `HIVE_DNS_GEO_ENDPOINT` is the only remote
   call and must stay optional. `GeoCache` never blocks the DNS loop; its memo
-  persists to `$HIVE_DATA/dns_geo.json` (never `PlatformSnapshot`). A tailored
-  answer carries a non-zero ECS scope; health beats proximity. Seer answers are
-  bounded (`MAX_RECORD_VALUE_BYTES` 4096, `MAX_RECORDS_PER_NAME_KIND` 32; UDP
-  >1232 bytes truncated with TC=1).
+  persists to `$HIVE_DATA/dns_geo.json`. A tailored answer carries a non-zero ECS
+  scope; health beats proximity. Seer answers are bounded
+  (`MAX_RECORD_VALUE_BYTES` 4096, `MAX_RECORDS_PER_NAME_KIND` 32; UDP >1232 bytes
+  truncated with TC=1).
 - Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s
   `aliases_full`), checked before any first-label/wildcard lookup. Attachment is
   gated on observed DNS proof — the activating node itself must observe the
@@ -467,8 +414,7 @@ memories/notes whose durable content it absorbed.
   offers HTTP-01 for a wildcard), and the port-80 listener answers
   `/.well-known/acme-challenge/` from the replicated `Http01Store`, proxying a MISS
   to the leader — the 443 arm alone is not enough, because LE fetches over plain
-  HTTP within ~1s from random nodes. `custom_cert_pass` holds a per-bundle
-  `IssuingGuard`; detach and project death both revoke TLS.
+  HTTP within ~1s from random nodes.
 
 ## Security gates (never weaken)
 
@@ -490,20 +436,17 @@ memories/notes whose durable content it absorbed.
   without carrying the previous key in `HIVE_SECRET_KEY_OLD`** (comma-separated
   hex) — `decrypt` returns its input unchanged on AEAD failure, so an orphaned
   value silently hands callers raw `enc:v1:` ciphertext. `try_decrypt` is the
-  honest `Option`-returning variant; `secrets::audit_at_rest()` logs values no
-  configured key can open at boot.
+  honest `Option`-returning variant.
 - `ProjectStore::put_env` force-masks credential-shaped values regardless of the
   caller's `sensitive` flag (`project_settings::looks_like_secret`) — extend the
-  prefix list, never trust the UI checkbox.
-- Mesh trust is an allowlist enforced at two gates (transport allowlist and the
-  gossip signer check); a valid signature from an unlisted signer is rejected.
+  prefix list, never trust the UI checkbox. Mesh trust is an allowlist enforced at
+  two gates (transport allowlist and the gossip signer check).
 - PQ transport: the mesh QUIC transport offers hybrid X25519MLKEM768 first via an
   explicit `.crypto_provider(...)` — mandatory, because iroh's `N0`/`Minimal`
   presets prefer plain `ring` (zero PQ) whenever both TLS backends are compiled in.
-  Report the REAL negotiated group (`hive_p2p::pq_kex_stats`), never a config flag.
-  **Transport IDENTITY stays classical** (`EndpointId` is ed25519) — never claim
-  post-quantum or ML-DSA identity anywhere. Public HTTPS/DB-gateway/relay outer
-  TLS deliberately stays on `ring`.
+  Report the REAL negotiated group (`hive_p2p::pq_kex_stats`). **Transport
+  IDENTITY stays classical** (`EndpointId` is ed25519) — never claim post-quantum
+  or ML-DSA identity. Public HTTPS/DB-gateway/relay TLS stays `ring`.
 - TLS resumption is fleet-shared (`FleetTicketer` in `acme.rs`, key derived from
   `HIVE_SECRET_KEY`, 6h rotation, current-or-previous epoch, 0-RTT off, disabled
   with `HIVE_TLS_SHARED_TICKETS=0`) because rustls defaults to an in-process ticket
@@ -512,8 +455,8 @@ memories/notes whose durable content it absorbed.
 - Mesh resource bounds: `HIVE_P2P_MAX_STREAMS` (256) is set explicitly to agree
   with `max_concurrency`, and the connection semaphore permit is acquired BEFORE
   the spawn so it bounds live connections rather than accept rate. iroh-relay
-  1.0.2's `accept_conn_limit`/`accept_conn_burst` are documented as unimplemented
-  — setting them would look like a cap while enforcing nothing.
+  1.0.2's `accept_conn_limit`/`accept_conn_burst` are unimplemented — setting them
+  would look like a cap while enforcing nothing.
 - Reserved proof names (`_acme-challenge`, `_hive-verify`, any case) are rejected
   in add/import/zone-parse so the proof channel is unforgeable; wildcards follow
   RFC 4592 (never at the apex, never over reserved names).
