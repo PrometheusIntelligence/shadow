@@ -5394,16 +5394,68 @@ fn slug(s: &str) -> String {
         .join("-")
 }
 
+/// A DNS label is capped at 63 bytes (RFC 1035 2.3.4). Vercel rejects a longer
+/// one outright, so an over-long alias is never created and the DNS reconciler
+/// reports the name as DARK on every single pass. Witnessed live:
+/// `defense-network-ui-lib-git-copilot-dynamic-history-viewer-updates` (65
+/// chars, from project `defense-network-ui-lib` + branch
+/// `copilot-dynamic-history-viewer-updates`) failed `vercel create` forever.
+const MAX_DNS_LABEL: usize = 63;
+
+/// FNV-1a, dependency-free: only used to keep two long names from colliding
+/// onto one hostname after truncation, never for security. Truncated to 32
+/// bits so the suffix is 8 hex chars — long enough to avoid collisions, short
+/// enough to leave most of the original name intact, and still inside the
+/// 6..=12 hex-digit tail that `vercel_dns::is_commit_alias` matches on.
+fn label_digest(label: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in label.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", hash as u32)
+}
+
+/// Shorten an over-long label to <= 63 BYTES (the limit is bytes, not chars),
+/// appending a digest of the FULL desired label so distinct long names stay
+/// distinct. The cut is taken on a char boundary so a multi-byte name can
+/// never panic or split a character, and a trailing '-' is trimmed because a
+/// label may not end with one.
+fn clamp_dns_label(label: &str) -> String {
+    if label.len() <= MAX_DNS_LABEL {
+        return label.to_string();
+    }
+    let digest = label_digest(label);
+    let budget = MAX_DNS_LABEL.saturating_sub(digest.len() + 1);
+    let mut cut = 0usize;
+    let mut used = 0usize;
+    for (index, ch) in label.char_indices() {
+        if used + ch.len_utf8() > budget {
+            cut = index;
+            break;
+        }
+        used += ch.len_utf8();
+        cut = index + ch.len_utf8();
+    }
+    format!("{}-{}", label[..cut].trim_end_matches('-'), digest)
+}
+
 /// Immutable commit URL label: `<project>-<shortsha>` (Vercel's per-commit URL).
 fn commit_alias(project: &str, commit: &str) -> String {
     let short: String = commit.chars().take(7).collect();
-    format!("{}-{}", slug(project), slug(&short))
+    clamp_dns_label(&format!("{}-{}", slug(project), slug(&short)))
 }
 
 /// Branch URL label: `<project>-git-<branch>` — always points at the latest
 /// deployment on that branch (Vercel's per-branch URL).
 fn branch_alias(project: &str, branch: &str) -> String {
-    format!("{}-git-{}", slug(project), slug(branch))
+    // The `-git-` marker is load-bearing downstream: `vercel_dns::is_commit_alias`
+    // reads it to tell this stable per-branch URL apart from a per-commit one,
+    // so it must survive the clamp. Truncating the built label achieves that
+    // whenever the project name is reasonably sized; a pathologically long
+    // project name may still lose it, which is harmless (it only affects an
+    // affinity optimisation, never routing).
+    clamp_dns_label(&format!("{}-git-{}", slug(project), slug(branch)))
 }
 
 /// Point `key` at deployment `id` only if `id` is "newer" than whatever the alias
