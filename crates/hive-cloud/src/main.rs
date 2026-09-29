@@ -514,6 +514,33 @@ fn main() -> anyhow::Result<()> {
         .block_on(async_main())
 }
 
+/// Whether a Seer bind is reachable by external resolvers on :53.
+///
+/// Requiring a literal `0.0.0.0`/`::`/`[::]` bind silently disqualified a node
+/// bound to its OWN address behind 1:1 NAT — the only bind that leaves wildcard
+/// :53 free for netavark/aardvark-dns, which is what lets the isolated
+/// BuildExecutor be provisioned. Such a node answers correctly through NAT yet
+/// vanished from the geo/api NS set, so the reconciler reported few proven
+/// nameservers and HELD the delegation. Loopback/dev binds must still never
+/// count: advertising one would publish a black hole in the delegated zone.
+fn dns_bind_reaches_internet(addr: &str) -> bool {
+    if addr.rsplit(':').next() != Some("53") {
+        return false;
+    }
+    let host = addr.rsplit_once(':').map(|(host, _)| host).unwrap_or("");
+    if host == "127.0.0.1" || host == "::1" || host == "[::1]" || host.starts_with("127.") {
+        return false;
+    }
+    if host == "0.0.0.0" || host == "::" || host == "[::]" {
+        return true;
+    }
+    // A specific non-loopback address is reachable only because the platform
+    // publishes it: without a public IP nothing forwards :53 to this node.
+    std::env::var("HIVE_PUBLIC_IP")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
 async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1117,12 +1144,9 @@ async fn async_main() -> anyhow::Result<()> {
         // reach the listener. Peers prove that separately and gossip the
         // result (`dns_attest`, `dns_probe::spawn_ns_prober`), and the DNS
         // reconciler publishes an NS only for a node that is currently proven.
-        dns_ns: std::env::var("HIVE_DNS_ADDR").ok().and_then(|a| {
-            let port_is_53 = a.rsplit(':').next() == Some("53");
-            let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
-            let public_bind = host == "0.0.0.0" || host == "[::]" || host == "::";
-            (port_is_53 && public_bind).then(|| a.clone())
-        }),
+        dns_ns: std::env::var("HIVE_DNS_ADDR")
+            .ok()
+            .filter(|addr| dns_bind_reaches_internet(addr)),
         // API-zone capability: this binary's Seer answers `api.{platform}`
         // (see dnsserver::api_zone), so a public-`:53` node may appear in that
         // zone's NS set. Older binaries never set this, which is what gates the
@@ -1130,11 +1154,7 @@ async fn async_main() -> anyhow::Result<()> {
         dns_api: {
             let ns_ok = std::env::var("HIVE_DNS_ADDR")
                 .ok()
-                .map(|a| {
-                    let port_is_53 = a.rsplit(':').next() == Some("53");
-                    let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
-                    port_is_53 && (host == "0.0.0.0" || host == "[::]" || host == "::")
-                })
+                .map(|a| dns_bind_reaches_internet(&a))
                 .unwrap_or(false);
             ns_ok
                 && std::env::var("HIVE_PLATFORM_DOMAIN")
