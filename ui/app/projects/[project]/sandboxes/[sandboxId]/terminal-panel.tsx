@@ -41,6 +41,7 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
   const retriedRef = useRef(false);
   const [state, setState] = useState<ConnState>("closed");
   const [wrongNodeOwner, setWrongNodeOwner] = useState<string | null>(null);
+  const [wrongNodeReason, setWrongNodeReason] = useState<string | null>(null);
   const [diagnosis, setDiagnosis] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [connectNonce, setConnectNonce] = useState(0);
@@ -129,6 +130,7 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
 
     setState("connecting");
     setWrongNodeOwner(null);
+    setWrongNodeReason(null);
     setDiagnosis(null);
     const url = `${wsBase()}/v1/projects/${encodeURIComponent(project)}/sandboxes/${sandboxId}/shell?cols=${term.cols}&rows=${term.rows}`;
     const socket = new WebSocket(url);
@@ -155,8 +157,19 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
           const msg = JSON.parse(ev.data);
           if (msg.type === "wrong_node") {
             setWrongNodeOwner(msg.owner ?? null);
+            // The server's own reason wins. Cross-node sessions are TUNNELED
+            // over the mesh (there is no cert-covered per-node hostname to
+            // redirect a browser to), so "reconnect from a session against
+            // that node" was never actionable advice — the owner's refusal
+            // (not the owner, unsupported build, or a shell it could not open)
+            // is the only honest thing to show.
+            const reason =
+              typeof msg.message === "string" && msg.message.length > 0
+                ? msg.message
+                : "this node could not tunnel the terminal to the sandbox's owner";
+            setWrongNodeReason(reason);
             setState("wrong-node");
-            term.writeln(`\r\n\x1b[33m[this sandbox is hosted on node "${msg.owner}" — reconnect from a session against that node]\x1b[0m`);
+            term.writeln(`\r\n\x1b[33m[${reason}]\x1b[0m`);
           } else if (msg.type === "exited") {
             term.writeln(`\r\n\x1b[2m[process exited${msg.exit_code != null ? ` (${msg.exit_code})` : ""}]\x1b[0m`);
             setState("closed");
@@ -243,8 +256,15 @@ export function TerminalPanel({ project, sandboxId }: { project: string; sandbox
       </div>
       {wrongNodeOwner ? (
         <p className="mb-2 text-xs text-amber-500">
-          This sandbox&apos;s cell is hosted on node <code className="font-mono">{wrongNodeOwner}</code>. The terminal only
-          connects to the owning node directly — try again from a session routed there.
+          {wrongNodeReason ?? "This node could not tunnel the terminal to the sandbox's owner."}
+          {wrongNodeOwner ? (
+            <>
+              {" "}
+              Its cell is hosted on node <code className="font-mono">{wrongNodeOwner}</code>; the
+              session is forwarded over the mesh, so there is no per-node host to reconnect to —
+              try again shortly.
+            </>
+          ) : null}
         </p>
       ) : null}
       {diagnosis ? <p className="mb-2 text-xs text-red-500">{diagnosis}</p> : null}

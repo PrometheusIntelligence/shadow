@@ -1384,7 +1384,10 @@ fn default_rows() -> u16 {
 /// terminal permanently "disconnected" (witnessed live on
 /// `sbx_253aa161efc04c5b`, real Firecracker on fc-bangkok). `wrong_node` is
 /// now sent only when forwarding is impossible: the owner has no iroh address
-/// in the registry, this node has no mesh, or the mesh dial fails — still a
+/// in the registry, this node has no mesh, the mesh dial fails, or the OWNER
+/// refused the forward (a shell target bound to another project, an
+/// unsupported sandbox-shell protocol version, or a shell it could not open —
+/// `mesh_shell::resolve_sandbox_shell` names which in its own log) — still a
 /// clear typed close, never a silent hang or a half-open socket.
 async fn open_shell(
     ws: WebSocketUpgrade,
@@ -1489,15 +1492,19 @@ async fn open_shell(
                 "this sandbox's cell is hosted on a different node, and this node has no mesh path to reach it right now; try again shortly",
             ));
         };
-        let target = crate::mesh_shell::shell_target(&sandbox_id, cols, rows);
+        let target = crate::mesh_shell::shell_target(&project, &t, &sandbox_id, cols, rows);
         let raw = match mesh.open_raw_to_port(&owner, &addr_json, &target).await {
             Ok(raw) => raw,
             Err(e) => {
-                tracing::warn!(owner = %owner, sandbox = %sandbox_id, error = %e, "sandbox shell mesh forward failed");
+                // A peer running a binary predating the sandbox-shell target
+                // answers not-found for it (its `mesh_raw::resolve` has no
+                // marker arm at all), which is indistinguishable from "not the
+                // owner" over the wire — say so instead of blaming the mesh.
+                tracing::warn!(owner = %owner, sandbox = %sandbox_id, error = %e, "sandbox shell mesh forward failed (target not admitted by the owner: it is not this sandbox's owner, or it runs a build without sandbox-shell forwarding)");
                 return Ok(wrong_node_close(
                     ws,
                     owner,
-                    "could not reach this sandbox's owning node over the mesh; try again shortly",
+                    "this sandbox's owning node did not accept the terminal forward — it is not this sandbox's owner, or it runs a build without cross-node sandbox-shell forwarding",
                 ));
             }
         };
@@ -1509,7 +1516,9 @@ async fn open_shell(
             &sandbox_id,
             &format!("owner: {owner} (forwarded over mesh)"),
         );
-        return Ok(ws.on_upgrade(move |socket| crate::mesh_shell::bridge_client_side(socket, raw)));
+        return Ok(ws.on_upgrade(move |socket| {
+            crate::mesh_shell::bridge_client_side(socket, raw, owner)
+        }));
     }
 
     c.audit
