@@ -47,9 +47,16 @@ use crate::store_sync::{self, SyncedStore};
 /// (~19 KB/s) well under the trunk instead of level with it, which is what
 /// keeps the pull that does run fast enough to finish.
 const LARGE_STORE_PULL_EVERY: Duration = Duration::from_secs(900);
-/// A failed large-lane pull is retried after this long (never the 5-min
-/// floor: a failure is not a size proof).
+/// A failed large-lane pull is retried after this long the FIRST time; each
+/// consecutive failure doubles the wait up to [`LARGE_STORE_PULL_EVERY`]. A
+/// flat 60 s retry was the feedback loop that starved the owner: a pull that
+/// ran out its budget because the owner's egress was saturated came back
+/// 60 s later and re-saturated it (fc-virginia-3 logged 73 consecutive FAILED
+/// pulls of billing/docs/incidents from fc-sanjose). A failure is still not a
+/// size proof, so the store stays in the lane; it just stops hammering.
 const LARGE_STORE_RETRY: Duration = Duration::from_secs(60);
+/// Consecutive failures after which the retry wait stops doubling.
+const LARGE_STORE_RETRY_DOUBLINGS: u32 = 4;
 /// The large lane's round cadence.
 const LARGE_LANE_TICK: Duration = Duration::from_secs(30);
 
@@ -343,6 +350,17 @@ async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
 
 /// One large-lane round: every due large store, one at a time.
 async fn pull_large(cloud: &Arc<CloudState>, shared: &SharedState, target: &Target) {
+    if !pulls_large_stores(cloud) {
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| {
+            tracing::info!(
+                "store large-lane: this node runs the mock cell backend and is never a public \
+                 ingress -- not pulling large stores (billing/incidents/audit) from the owner; \
+                 small stores still replicate through the batch (HIVE_STORE_SYNC_LARGE=1 forces on)"
+            );
+        });
+        return;
+    }
     let due: Vec<(&'static SyncedStore, usize)> = {
         let sh = shared.lock();
         store_sync::REGISTRY
@@ -406,6 +424,9 @@ struct StoreLane {
     suspect: bool,
     /// When the lane may pull this store again (`None` = now).
     next_pull: Option<std::time::Instant>,
+    /// Consecutive failed lane pulls; reset by a success. Drives the retry
+    /// backoff in [`StoreLanes::pulled`].
+    failures: u32,
 }
 
 impl StoreLanes {
@@ -455,11 +476,45 @@ impl StoreLanes {
         match len {
             Some(_) => {
                 lane.suspect = false;
+                lane.failures = 0;
                 lane.next_pull = Some(now + LARGE_STORE_PULL_EVERY);
             }
-            None => lane.next_pull = Some(now + LARGE_STORE_RETRY),
+            None => {
+                lane.failures = lane.failures.saturating_add(1);
+                let doublings = lane.failures.saturating_sub(1).min(LARGE_STORE_RETRY_DOUBLINGS);
+                let wait = (LARGE_STORE_RETRY * 2u32.pow(doublings)).min(LARGE_STORE_PULL_EVERY);
+                lane.next_pull = Some(now + wait);
+            }
         }
     }
+}
+
+/// Whether this node pulls LARGE stores at all. A laptop-class node -- one
+/// running the mock cell backend, which is every macOS node and every dev
+/// node behind a home NAT -- is never a public ingress and serves no tenant
+/// traffic, so it has no use for the multi-megabyte billing, incidents and
+/// audit snapshots; it still receives every small store (projects, teams,
+/// browser admissions) through the batch. Measured 2026-09-30 on the owner:
+/// of ~6 Mbit/s of mesh QUIC leaving fc-sanjose, 3.78 Mbit/s went to the one
+/// residential NAT that hosts the seven mock-backend followers, on a public
+/// egress capped at ~10-12 Mbit/s -- the reason every cloud follower's pull
+/// of those same stores ran at 3-110 KB/s or timed out. Fixing it here, at
+/// the one place the lane decides to pull, fixes every such node at once.
+/// `HIVE_STORE_SYNC_LARGE=1` forces the lane on (a mock node that must hold
+/// billing for local development), `0` forces it off.
+fn pulls_large_stores(cloud: &CloudState) -> bool {
+    match std::env::var("HIVE_STORE_SYNC_LARGE").ok().as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    let mock = cloud
+        .registry
+        .nodes()
+        .iter()
+        .find(|n| n.is_self)
+        .is_some_and(|n| n.backend == "mock");
+    !mock
 }
 
 /// Per-store accounting for the follower pull. A failed snapshot fetch was a
