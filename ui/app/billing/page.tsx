@@ -22,9 +22,14 @@ export default function BillingPage() {
 function BillingInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const { data, refresh } = usePoll<BillingInfo>("/v1/billing", 5000);
-  const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 5000);
-  const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", 10000);
+  // Billing is slow-moving, and `/v1/billing/ledger` is measured at a flat
+  // ~10s against the live fleet (its relational mirror table is wedged), so
+  // polling it every 5s held a request in flight permanently. A checkout or
+  // plan change still invalidates the shared GET cache and `refresh` is
+  // called explicitly after any mutation on this page.
+  const { data, refresh } = usePoll<BillingInfo>("/v1/billing", 30000);
+  const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 120000);
+  const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", 60000);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
 

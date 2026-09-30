@@ -6,7 +6,9 @@ import { apiSend, usePoll, type CronJob } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function CronPage() {
-  const { data: jobs, refresh } = usePoll<CronJob[]>("/v1/cron", 2000);
+  // Cron DEFINITIONS change only when a job is created/edited/deleted — this
+  // page's own mutations invalidate the shared GET cache and call `refresh`.
+  const { data: jobs, refresh } = usePoll<CronJob[]>("/v1/cron", 15000);
   const [name, setName] = useState("");
   const [schedule, setSchedule] = useState("0 * * * * *");
   const [deployment, setDeployment] = useState("hello");

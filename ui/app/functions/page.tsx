@@ -4,7 +4,10 @@ import { Badge, PageHeader, Table, Th, Td } from "@/components/ui";
 import { usePoll, type FunctionStats } from "@/lib/api";
 
 export default function FunctionsPage() {
-  const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 2000);
+  // Measured at 0.7-6.1s against the live fleet (the read fans out across
+  // nodes), so a 2s interval kept overlapping requests permanently in flight.
+  // The function list only changes on deploy.
+  const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 15000);
   return (
     <div>
       <PageHeader title="Functions" desc="Fluid compute — instances multiplex concurrent requests, scale to zero, and bill Active CPU + memory (not idle wall-time)" />

@@ -59,8 +59,12 @@ function bucketLabel(gran: Gran, t_ms: number) {
 }
 
 export default function UsageView() {
-  const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 3000);
-  const { data: billing } = usePoll<BillingInfo>("/v1/billing", 5000);
+  // `/v1/functions` is measured at 0.7-6.1s against the live fleet (it fans
+  // out across nodes), so a 3s interval kept overlapping requests in flight;
+  // the list only changes on deploy. Billing is slow-moving and already
+  // de-duped to one read per 20s by the shared GET cache TTL.
+  const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 15000);
+  const { data: billing } = usePoll<BillingInfo>("/v1/billing", 30000);
   // Default to Monthly on first load (billing-cycle-level view is the most useful
   // landing granularity); the Daily/Weekly toggles narrow the window on demand.
   const [gran, setGran] = useState<Gran>("Monthly");

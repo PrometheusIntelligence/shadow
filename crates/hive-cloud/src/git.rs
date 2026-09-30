@@ -5038,6 +5038,18 @@ async fn run_build(
                 cloud.gw.backend_name(),
                 runtime_workdir
             ));
+            // A skipped venv must be visible here, not only in the journal:
+            // the artifact the operator inspects deliberately lacks something
+            // the repository has, and the reason has to be in the build log.
+            for path in sealed.skipped_python_environments() {
+                log(format!(
+                    "Omitted {} from the runtime artifact: a Python environment is host-specific \
+                     (its interpreter is an absolute symlink that cannot be sealed beneath the \
+                     checkout), so it is not in the artifact — start the function with the \
+                     platform interpreter (\"python3\"), never a venv path.",
+                    path.display()
+                ));
+            }
             // The sealed value is RETAINED past local delivery: it is the one
             // artifact authority the generation transfer lane sends to remote
             // targets, byte-identical to what this node just delivered.

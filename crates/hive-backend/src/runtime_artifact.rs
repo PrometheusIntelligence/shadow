@@ -142,6 +142,11 @@ pub struct SealedRuntimeArtifact {
     content_sha256: String,
     store_root: PathBuf,
     package_descriptor: RuntimeArtifactPackageDescriptor,
+    /// Host-specific Python environments the checkout carried and staging
+    /// omitted. Reported, never silently dropped: an operator comparing the
+    /// artifact against the repository has to be able to see that a venv was
+    /// deliberately left out.
+    skipped_python_environments: Vec<PathBuf>,
 }
 
 /// One read-only descriptor for the exact deterministic package bound to a
@@ -241,6 +246,13 @@ impl SealedRuntimeArtifact {
 
     pub fn content_sha256(&self) -> &str {
         &self.content_sha256
+    }
+
+    /// Checkout-relative paths of host-specific Python environments (`.venv`,
+    /// `venv`, `.tox`, `.nox`) that staging refused to seal. Empty for every
+    /// deployment that ships none; never empty when the repository carried one.
+    pub fn skipped_python_environments(&self) -> &[PathBuf] {
+        &self.skipped_python_environments
     }
 
     pub fn package_descriptor(&self) -> &RuntimeArtifactPackageDescriptor {
@@ -415,6 +427,7 @@ pub(crate) struct StagedRuntimeArtifact {
     logical_bytes: u64,
     materialized_bytes: u64,
     entries: u64,
+    skipped_python_environments: Vec<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     root_parent: File,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -578,7 +591,7 @@ impl StagedRuntimeArtifact {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn publish_host(
-        self,
+        mut self,
         store_root: PathBuf,
         app_rel: PathBuf,
         package_descriptor: RuntimeArtifactPackageDescriptor,
@@ -640,6 +653,7 @@ impl StagedRuntimeArtifact {
             content_sha256: digest,
             store_root,
             package_descriptor,
+            skipped_python_environments: std::mem::take(&mut self.skipped_python_environments),
         })
     }
 }
@@ -1607,6 +1621,7 @@ pub fn reopen_sealed_runtime_artifact(
         content_sha256: descriptor.semantic_tree_sha256.clone(),
         store_root: store_root.to_path_buf(),
         package_descriptor: descriptor.clone(),
+        skipped_python_environments: Vec::new(),
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -1843,6 +1858,9 @@ struct MaterializeContext<'a> {
     active_directories: HashSet<(u64, u64)>,
     unique_files: HashSet<(u64, u64)>,
     hardlinks: HashMap<(u64, u64), HardlinkProof>,
+    /// Host-specific Python environments omitted from the artifact, keyed by
+    /// logical path so one noisy tree is reported once.
+    skipped_python_environments: HashSet<PathBuf>,
     content: Sha256,
 }
 
@@ -2092,6 +2110,7 @@ fn stage_blocking_from_checkout(
         active_directories: HashSet::new(),
         unique_files: HashSet::new(),
         hardlinks: HashMap::new(),
+        skipped_python_environments: HashSet::new(),
         content,
     };
 
@@ -2123,11 +2142,17 @@ fn stage_blocking_from_checkout(
     let logical_bytes = context.totals.logical_bytes;
     let materialized_bytes = context.totals.materialized_bytes;
     let entries = context.totals.materialized_entries.saturating_add(1);
+    let mut skipped_python_environments: Vec<PathBuf> =
+        std::mem::take(&mut context.skipped_python_environments)
+            .into_iter()
+            .collect();
+    skipped_python_environments.sort();
     drop(context);
     staged.content_sha256 = hex_digest(&digest);
     staged.logical_bytes = logical_bytes;
     staged.materialized_bytes = materialized_bytes;
     staged.entries = entries;
+    staged.skipped_python_environments = skipped_python_environments;
     Ok(staged)
 }
 
@@ -2404,6 +2429,18 @@ fn materialize_entry(
                     "runtime artifact rejects symlink at excluded path {}",
                     child_logical.display()
                 );
+                if python_venv_dir(&child.name)
+                    && context
+                        .skipped_python_environments
+                        .insert(child_logical.clone())
+                {
+                    tracing::warn!(
+                        path = %child_logical.display(),
+                        "runtime artifact omitted a host-specific Python environment; its \
+                         interpreter is an absolute symlink that cannot be sealed beneath the \
+                         checkout and could not be relocated to another node anyway"
+                    );
+                }
                 continue;
             }
             anyhow::ensure!(
@@ -3084,6 +3121,7 @@ fn create_stage_in(parent: &File) -> anyhow::Result<StagedRuntimeArtifact> {
             logical_bytes: 0,
             materialized_bytes: 0,
             entries: 0,
+            skipped_python_environments: Vec::new(),
             root_parent,
             root_descriptor,
             _active: active,
@@ -3924,11 +3962,50 @@ fn hex_digest(bytes: &[u8]) -> String {
     value
 }
 
+/// A tool-managed Python environment or bytecode cache. These are HOST-SPECIFIC
+/// and cannot be sealed: `bin/python` is a symlink to an absolute interpreter
+/// path outside the checkout (`/usr/bin/python3.x`), so `openat2`'s
+/// `RESOLVE_BENEATH`/`RESOLVE_NO_XDEV` answer EXDEV for it — measured 2026-09-29
+/// in a Linux container, where the same call on an in-tree relative symlink
+/// succeeds — and `pyvenv.cfg` records that interpreter path literally, so the
+/// directory could not be relocated to another node even if it could be sealed.
+/// Nothing in this platform installs Python dependencies at build time, so a
+/// sealed artifact never needs one. Skipping them mirrors `.git`/`.npm`/`.cache`
+/// rather than dereferencing an escaping symlink into the artifact, which would
+/// give up the containment `RESOLVE_BENEATH` exists to provide.
+fn python_environment_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        matches!(
+            name,
+            ".venv"
+                | "venv"
+                | ".tox"
+                | ".nox"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".mypy_cache"
+                | ".ruff_cache"
+        )
+    })
+}
+
+/// The subset of [`python_environment_dir`] that carries an interpreter, i.e.
+/// the one an operator could believe the deployment runs from. Its omission is
+/// recorded and WARNed so the artifact visibly lacks a venv; the pure bytecode
+/// and tool caches above are dropped silently, exactly like `.turbo`/`.cache`.
+fn python_venv_dir(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| matches!(name, ".venv" | "venv" | ".tox" | ".nox"))
+}
+
 fn excluded(path: &Path) -> bool {
     path.components().any(|component| {
         let Component::Normal(name) = component else {
             return false;
         };
+        if python_environment_dir(name) {
+            return true;
+        }
         matches!(
             name.to_str(),
             Some(
