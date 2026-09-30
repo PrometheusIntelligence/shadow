@@ -3350,13 +3350,25 @@ fn guardian_v2_latest_entry<'a>(
         .max_by_key(|head| head.timestamp)
 }
 
-async fn guardian_v2_current_exact(
+/// Same decision as [`guardian_v2_current_exact`], against an ALREADY-FETCHED
+/// head listing.
+///
+/// `entry_heads()` enumerates EVERY entry in the replicated doc, so it must
+/// never be called once per key: a batch writing 72 namespaces used to pay
+/// ~225 full-document walks per generation (72 x (1 here + 2 in
+/// `guardian_v2_verify_namespace`) plus the part walks). On a node whose walk
+/// is slow that is the difference between a batch that commits in seconds and
+/// one that never returns at all — and the writer that never returns holds the
+/// only replication slot, so the whole guardian subsystem stops advancing
+/// (live-witnessed on fc-sanjose, 2026-09-30). Callers that already hold a
+/// listing pass it in; see `write_replication_batch`.
+async fn guardian_v2_current_exact_in(
+    heads: &[guardian_db::traits::EntryHead],
     h: &Handle,
     key: &str,
     value: &PreparedValue,
 ) -> anyhow::Result<bool> {
-    let heads = h.kv.entry_heads().await?;
-    let Some(head) = guardian_v2_latest_entry(&heads, key) else {
+    let Some(head) = guardian_v2_latest_entry(heads, key) else {
         return Ok(false);
     };
     if head.content_local == Some(false)
@@ -3365,6 +3377,15 @@ async fn guardian_v2_current_exact(
         return Ok(false);
     }
     Ok(matches!(h.kv.get(key).await, Ok(Some(bytes)) if bytes.as_slice() == value.bytes.as_slice()))
+}
+
+async fn guardian_v2_current_exact(
+    h: &Handle,
+    key: &str,
+    value: &PreparedValue,
+) -> anyhow::Result<bool> {
+    let heads = h.kv.entry_heads().await?;
+    guardian_v2_current_exact_in(&heads, h, key, value).await
 }
 
 async fn guardian_v2_publish_immutable(
@@ -3405,17 +3426,13 @@ async fn guardian_v2_publish_immutable(
 
 async fn guardian_v2_verify_namespace(
     h: &Handle,
+    heads: &[guardian_db::traits::EntryHead],
+    heads_before: &[guardian_db::traits::EntryHead],
     key: &str,
     expected: &PreparedValue,
+    was_reused: bool,
 ) -> anyhow::Result<()> {
-    let before = h.kv.entry_heads().await?;
-    let head = guardian_v2_latest_entry(&before, key)
-        .map(|head| SnapshotKeyHead {
-            timestamp: head.timestamp,
-            hash: head.hash.clone(),
-        })
-        .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace metadata is absent for {key}"))?;
-    let source = guardian_v2_latest_entry(&before, key)
+    let source = guardian_v2_latest_entry(heads, key)
         .ok_or_else(|| anyhow::anyhow!("Guardian v2 namespace metadata is absent for {key}"))?;
     if source.content_local == Some(false) {
         anyhow::bail!("Guardian v2 namespace content is not local for {key}");
@@ -3427,14 +3444,23 @@ async fn guardian_v2_verify_namespace(
     if bytes.as_slice() != expected.bytes.as_slice()
         || bytes.len() != expected.bytes.len()
         || sha256(&bytes) != expected.change_digest
-        || iroh_blobs::Hash::new(&bytes).to_hex() != head.hash
+        || iroh_blobs::Hash::new(&bytes).to_hex() != source.hash
     {
         anyhow::bail!("Guardian v2 namespace identity mismatch for {key}");
     }
     guardian_v2_parse_namespace(&bytes)?;
-    let after = h.kv.entry_heads().await?;
-    if latest_snapshot_head(&after, key) != Some(head) {
-        anyhow::bail!("Guardian v2 namespace metadata changed during verification for {key}");
+    // A key the batch decided was ALREADY current must not have moved while
+    // the batch was in flight. That is what the old per-key second listing
+    // caught; the two batch-level listings catch it for free. A key this batch
+    // just wrote is expected to differ from `heads_before`, so it is exempt.
+    if was_reused {
+        let head = SnapshotKeyHead {
+            timestamp: source.timestamp,
+            hash: source.hash.clone(),
+        };
+        if latest_snapshot_head(heads_before, key) != Some(head) {
+            anyhow::bail!("Guardian v2 namespace metadata changed during verification for {key}");
+        }
     }
     Ok(())
 }
@@ -4099,13 +4125,26 @@ async fn write_replication_batch(
     maybe_guardian_v2_diagnostic(h, desired).await?;
 
     let mut stats = ReplicationWriteStats::default();
+    // ONE head listing for the whole batch. `entry_heads()` enumerates every
+    // entry in the replicated doc, so the old per-key shape cost
+    // `3 * namespaces` full-document walks per generation (one here, two in
+    // `guardian_v2_verify_namespace`) — 72 namespaces meant ~216 walks, plus
+    // one per part. Where a single walk is cheap that is seconds; where it is
+    // not, the batch never returns, and the writer that never returns holds
+    // the only replication slot, so the guardian subsystem stops advancing
+    // (live-witnessed on fc-sanjose, 2026-09-30: batches stopped at 12:14:55
+    // and never logged success or failure again). Two listings per batch is
+    // the same guarantee at 1/108th the cost.
+    let heads_before = h.kv.entry_heads().await?;
+    let mut reused = std::collections::BTreeSet::new();
     for (key, value) in &desired.namespaces {
-        let live_matches = guardian_v2_current_exact(h, key, value).await?;
+        let live_matches = guardian_v2_current_exact_in(&heads_before, h, key, value).await?;
         {
             let mut counters = write_counters().lock().unwrap_or_else(|p| p.into_inner());
             counters.namespaces.record_attempt(value.bytes.len());
             if live_matches {
                 counters.namespaces.record_no_op(value.bytes.len());
+                reused.insert(key.clone());
             }
         }
         if !live_matches {
@@ -4128,7 +4167,20 @@ async fn write_replication_batch(
             stats.namespace_puts += 1;
             stats.put_bytes += value.bytes.len();
         }
-        guardian_v2_verify_namespace(h, key, value).await?;
+    }
+
+    // One listing AFTER the whole batch, then verify every key against it.
+    let heads_after = h.kv.entry_heads().await?;
+    for (key, value) in &desired.namespaces {
+        guardian_v2_verify_namespace(
+            h,
+            &heads_after,
+            &heads_before,
+            key,
+            value,
+            reused.contains(key),
+        )
+        .await?;
         owned_namespaces.insert(key.clone(), value.change_digest);
     }
 
