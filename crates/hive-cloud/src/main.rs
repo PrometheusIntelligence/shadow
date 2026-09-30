@@ -1736,6 +1736,10 @@ async fn async_main() -> anyhow::Result<()> {
             Some(raw_resolver),
             Some(browser_admission),
             browser_crr,
+            // Store-snapshot replication shares the trunk fairly instead of
+            // queueing behind every probe — see
+            // `store_sync::SNAPSHOT_PATH_PREFIX`.
+            &[crate::store_sync::SNAPSHOT_PATH_PREFIX],
         ));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }

@@ -401,8 +401,10 @@ async fn dispatch_verified(
         // two bespoke arms above (kept only as rolling-upgrade compat shims for
         // followers still on the pre-registry build; remove once the fleet is
         // uniform). See `crate::store_sync`.
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/store-snapshot/") => {
-            let name = p["/v1/store-snapshot/".len()..]
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with(crate::store_sync::SNAPSHOT_PATH_PREFIX) =>
+        {
+            let name = p[crate::store_sync::SNAPSHOT_PATH_PREFIX.len()..]
                 .split(['?', '/'])
                 .next()
                 .unwrap_or("");

@@ -4481,6 +4481,7 @@ pub async fn serve_tunnels_with_join(
         None,
         None,
         None,
+        &[],
     )
     .await
 }
@@ -4491,6 +4492,8 @@ pub async fn serve_tunnels_with_join(
 /// [`serve_raw_target`]); without one they are answered [`RAW_TARGET_NOT_FOUND`]
 /// so an opener fails over instead of hanging. Trust semantics are identical to
 /// every other non-JOIN mode: an untrusted peer's raw-target streams are dropped.
+/// [`serve_tunnels_full`] plus a set of gossip request-path prefixes whose
+/// bulk responses are never deprioritized (see [`BulkExemptPrefixes`]).
 pub async fn serve_tunnels_full(
     ep: Endpoint,
     local_http: String,
@@ -4501,6 +4504,7 @@ pub async fn serve_tunnels_full(
     raw_resolver: Option<RawTargetResolver>,
     browser_admission: Option<BrowserAdmissionHandler>,
     browser_crr: Option<BrowserCrrHandler>,
+    bulk_exempt: BulkExemptPrefixes,
 ) {
     let browser_resources = BrowserInboundResources::new();
     let budgets = establish::InboundBudgets {
@@ -4670,6 +4674,7 @@ pub async fn serve_tunnels_full(
                 gossip,
                 join,
                 raw_resolver,
+                bulk_exempt,
             )
             .await;
         });
@@ -4761,6 +4766,7 @@ async fn serve_fleet_conn(
     gossip: Option<GossipHandler>,
     join: Option<JoinHandler>,
     raw_resolver: Option<RawTargetResolver>,
+    bulk_exempt: BulkExemptPrefixes,
 ) {
     let remote_id = conn.remote_id().to_string();
     if let Some(trust) = &trust {
@@ -4805,6 +4811,7 @@ async fn serve_fleet_conn(
                             mode[0] == STREAM_GOSSIP_SIGNED,
                             rid,
                             trust,
+                            bulk_exempt,
                         )
                         .await;
                     }
@@ -5127,6 +5134,29 @@ pub async fn serve_silent(ep: Endpoint) {
 /// snapshot) and is sent below the default stream priority.
 const BULK_RESPONSE_BYTES: usize = 256 << 10;
 
+/// Request-path prefixes whose responses are EXEMPT from bulk
+/// deprioritization: the caller asked for the bytes and is now blocked on
+/// them, so they share the trunk round-robin with every other
+/// default-priority stream instead of queueing behind all of them.
+///
+/// This exemption is NOT cosmetic. `quinn`'s scheduler is STRICT priority —
+/// `pending.pop()` never returns a `priority == -1` stream while any
+/// `priority >= 0` stream has pending data — so on a trunk that always has
+/// some default-priority traffic (a follower's own store batch, health
+/// probes, gossip rounds, tunnels) a deprioritized multi-MB reply makes no
+/// progress at all: measured live, a 6.33 MB billing snapshot stalled for a
+/// full 45 s idle budget after 1,042,233 bytes and then ran out its 240 s
+/// fetch budget, while a 223,637-byte snapshot one step under
+/// [`BULK_RESPONSE_BYTES`] finished in 2.8 s on the same trunk at the same
+/// instant. Deprioritizing is only correct for a bulk reply nobody is
+/// waiting on; a replication pull is the opposite shape.
+///
+/// Fairness is preserved by `TransportConfig::send_fairness` (default
+/// `true`): among equal-priority streams `quinn` round-robins by recency, so
+/// a small probe on the same trunk still completes within one round of the
+/// queue. Deprioritization is what turned sharing into starvation.
+type BulkExemptPrefixes = &'static [&'static str];
+
 /// A response sink whose transmit priority can be lowered.
 trait ResponsePriority {
     /// Let every default-priority stream on the same connection go first.
@@ -5146,6 +5176,7 @@ async fn serve_gossip<R, W>(
     signed: bool,
     remote_id: String,
     trust: Option<TrustSet>,
+    bulk_exempt: BulkExemptPrefixes,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + ResponsePriority,
@@ -5233,12 +5264,18 @@ async fn serve_gossip<R, W>(
             return;
         }
     }
+    // Decided before the handler takes ownership of `path`.
+    let bulk_exempt_hit = bulk_exempt.iter().any(|prefix| path.starts_with(prefix));
     let resp = handler(m[0], path, body, verified_signer).await;
     // A bulk reply shares the ONE pooled trunk with probes, tunnels and small
     // gossip; at default priority a follower's `/v1/nodes` probe queued behind
     // a 10 MB snapshot could time out, and a failed probe closes the trunk
     // (killing the snapshot pull with it).
-    if resp.len() >= BULK_RESPONSE_BYTES {
+    //
+    // Exempt paths ([`BulkExemptPrefixes`]) are never deprioritized: the
+    // requester is blocked on those bytes, and strict-priority starvation
+    // there is worse than the probe latency it was meant to protect.
+    if resp.len() >= BULK_RESPONSE_BYTES && !bulk_exempt_hit {
         send.deprioritize();
     }
     let len = (resp.len() as u32).to_be_bytes();

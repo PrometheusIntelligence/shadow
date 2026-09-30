@@ -38,7 +38,15 @@ use crate::state::CloudState;
 use crate::store_sync::{self, SyncedStore};
 
 /// A large store is pulled at most once per this interval after a success.
-const LARGE_STORE_PULL_EVERY: Duration = Duration::from_secs(300);
+/// 15 min, not 5: two large stores (billing 6.3 MB, incidents 10.5 MB) at a
+/// 5-min cadence put ~56 KB/s of sustained bulk on one trunk, and a
+/// cross-country trunk sustaining 25-90 KB/s cannot carry that alongside the
+/// small-store batch — measured live, incidents went 113 s → 203 s → ran out
+/// its budget and then every later attempt failed, leaving megabytes of
+/// abandoned transfer on the connection. 15 min puts the sustained demand
+/// (~19 KB/s) well under the trunk instead of level with it, which is what
+/// keeps the pull that does run fast enough to finish.
+const LARGE_STORE_PULL_EVERY: Duration = Duration::from_secs(900);
 /// A failed large-lane pull is retried after this long (never the 5-min
 /// floor: a failure is not a size proof).
 const LARGE_STORE_RETRY: Duration = Duration::from_secs(60);
@@ -60,6 +68,13 @@ struct Shared {
     failures: StorePullFailures,
     /// The last batch failed every store: the lane holds off.
     link_down: bool,
+    /// A large-lane pull is on the trunk right now. The batch DEFERS while it
+    /// is: one trunk sustains ~50-100 KB/s to a cross-country peer (measured:
+    /// a 10.5 MB incidents snapshot took 113-231 s depending on how much of
+    /// the batch was running beside it), so 8 concurrent small fetches beside
+    /// a multi-MB transfer push EVERY small store past its 10 s budget, and
+    /// the large pull pays for the sharing too. Serial wins on both counts.
+    large_in_flight: bool,
     last_peer_lookup_warn: Option<std::time::Instant>,
     last_fallback_warn: Option<std::time::Instant>,
 }
@@ -81,6 +96,13 @@ pub fn spawn(cloud: Arc<CloudState>) {
                 loop {
                     tick.tick().await;
                     crate::supervise::beat("store-follower-sync");
+                    // The trunk is carrying a multi-MB pull: run the small
+                    // stores AFTER it, not beside it (see `large_in_flight`).
+                    // `MissedTickBehavior::Delay` means the deferred tick
+                    // fires as soon as the lane releases the trunk.
+                    if shared.lock().large_in_flight {
+                        continue;
+                    }
                     if let Some(target) = resolve_target(&cloud, &shared, true) {
                         pull_batch(&cloud, &shared, &target).await;
                     }
@@ -337,12 +359,20 @@ async fn pull_large(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
             break;
         }
         let started = std::time::Instant::now();
+        shared.lock().large_in_flight = true;
         let bytes =
             store_sync::fetch_snapshot(cloud, &target.peer_id, &target.peer_addr, store, hint)
                 .await;
         let elapsed = started.elapsed();
         {
             let mut sh = shared.lock();
+            sh.large_in_flight = false;
+            // A completed multi-MB pull proves the link even when the batch
+            // has not run for minutes (it defers to this lane), so a stale
+            // `link_down` can never park the lane behind it.
+            if bytes.is_some() {
+                sh.link_down = false;
+            }
             sh.lanes.pulled(store.name, bytes.as_ref().map(Vec::len));
             sh.failures
                 .record_lane(cloud, &target.leader, store.name, bytes.is_some(), elapsed);

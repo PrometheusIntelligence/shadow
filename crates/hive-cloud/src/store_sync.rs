@@ -38,6 +38,21 @@ use crate::state::CloudState;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Wire path prefix every registry store is served under (`gossip::dispatch`
+/// matches it, [`fetch_snapshot`] builds it).
+///
+/// Also the ONE gossip path whose bulk responses must NOT be deprioritized on
+/// the serving trunk: `hive_p2p::serve_tunnels_full` takes it as
+/// `bulk_exempt`. A snapshot is multi-MB by design (billing 6.3 MB, incidents
+/// 10.5 MB) and the follower is BLOCKED on it, so queueing it below every
+/// default-priority stream — probes, tunnels, the follower's own batch —
+/// starves it indefinitely: measured live, billing ran out its whole 240 s
+/// budget at <26 KB/s while a 223,637-byte snapshot one step under
+/// `hive_p2p`'s bulk threshold finished in 2.8 s on the same trunk at the same
+/// instant. Deprioritizing it was never the protection it looked like; every
+/// other bulk reply (browser artifacts, TLS bundles, drive files) still is.
+pub const SNAPSHOT_PATH_PREFIX: &str = "/v1/store-snapshot/";
+
 /// One replicated store: its wire name plus serialize/adopt function pointers.
 pub struct SyncedStore {
     pub name: &'static str,
@@ -642,9 +657,15 @@ const SMALL_FETCH_SECS: u64 = 10;
 const SMALL_RESPONSE_CAP: usize = 16 << 20;
 /// Response bound for a large snapshot (the memory ceiling of one pull).
 const LARGE_RESPONSE_CAP: usize = 64 << 20;
-/// The slowest sustained rate a large budget is sized for — well under the
-/// measured ~170 KB/s, so a slow-but-moving trunk still finishes.
-const LARGE_MIN_RATE: usize = 64 << 10;
+/// The slowest sustained rate a large budget is sized for. Lowered from
+/// 64 KiB/s because that rate made the DERIVED budget smaller than the flat
+/// floor for every store the fleet actually has (billing 6.3 MB derived
+/// 149 s, incidents 10.5 MB derived 230 s), so `derived.max(floor)` always
+/// returned the floor and a 1-12 MB store got the same 240 s whether it was
+/// 1 MB or 10 MB. A trunk carrying a snapshot beside a follower's own batch
+/// sustains 25-90 KB/s live (64 ms RTT peers), so 32 KiB/s is the rate a
+/// budget must assume for the size term to be the one that binds.
+const LARGE_MIN_RATE: usize = 32 << 10;
 
 /// The latest snapshot size of each store any peer served this process.
 static REMOTE_BYTES: std::sync::Mutex<Option<HashMap<&'static str, usize>>> =
@@ -668,9 +689,16 @@ pub fn size_hint(store: &str, local_len: usize) -> usize {
 
 /// `(timeout_secs, response_cap)` for a fetch of `hint` bytes. Large: the
 /// time `hint` plus 25 % growth takes at [`LARGE_MIN_RATE`] plus 30 s of
-/// setup, floored at `HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS` (240) — and never
-/// below what the response cap could carry at that rate, so a store never
-/// grows into a budget that always fails.
+/// and never below what the response cap could carry at that rate, so a store
+/// never grows into a budget that always fails.
+///
+/// The floor is now only a SAFETY NET for a store whose size is still unknown
+/// (a suspect store planned at [`LARGE_STORE_BYTES`]): at [`LARGE_MIN_RATE`]
+/// the size term dominates it for every store the fleet has, so a 10.5 MB
+/// snapshot is allowed ~430 s and a 6.3 MB one ~272 s instead of both being
+/// cut off at 240 s. A flat floor that binds turns "slow" into "permanent
+/// failure" and, worse, leaves a multi-MB transfer occupying the trunk for the
+/// whole floor before it gives up.
 pub fn fetch_budget(hint: usize) -> (u64, usize) {
     if hint <= LARGE_STORE_BYTES {
         return (SMALL_FETCH_SECS, SMALL_RESPONSE_CAP);
@@ -696,7 +724,7 @@ pub async fn fetch_snapshot(
     hint: usize,
 ) -> Option<Vec<u8>> {
     let (timeout_secs, response_cap) = fetch_budget(hint);
-    let path = format!("/v1/store-snapshot/{}", store.name);
+    let path = format!("{}{}", SNAPSHOT_PATH_PREFIX, store.name);
     let bytes = crate::gossip::request_to_with_response_cap(
         cloud,
         peer_id,
