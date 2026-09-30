@@ -295,7 +295,7 @@ const nextConfig = {
       // Not `immutable`: these names are not content-hashed, so a bounded
       // max-age plus a long stale-while-revalidate is the honest choice.
       {
-        source: "/:file((?:globe-wireframe|globe-dark|globe-light)\\.(?:webp|png|svg))",
+        source: "/:file(globe-wireframe(?:-(?:1024|1536))?\\.(?:webp|png))",
         headers: cc(STATIC_ASSET_CACHE),
       },
       // Sensitive / dynamic management surfaces — never cache.

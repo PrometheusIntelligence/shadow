@@ -31,12 +31,19 @@ export function GlobeWireframe({ className }: { className?: string }) {
           block, so nothing can render at the artwork's intrinsic 2048px and
           shift the layout. */}
       <div className="relative w-full overflow-hidden" style={{ aspectRatio: "2048 / 762" }}>
-        {/* WebP first (lossless, 405 KB) with the optimized PNG as the
-            fallback for anything without WebP. `fetchPriority="high"` tells
-            the browser this is hero-critical rather than a late-discovered
-            image; without the fetch() it is discovered during HTML parse. */}
+        {/* Responsive sources: the artwork is 2048 wide but the box is
+            `max-w-6xl` (1152px minus padding), so a phone was downloading
+            405 KB for a ~390 CSS-px image. All three widths are WebP LOSSLESS
+            (verified pixel-identical to the original raster), so this costs no
+            fidelity — only bytes the device cannot resolve anyway. 1024w is
+            127 KB, 1536w is 275 KB, 2048w is 405 KB.
+            `fetchPriority="high"`: hero-critical, not a late-discovered image. */}
         <picture>
-          <source srcSet="/globe-wireframe.webp" type="image/webp" />
+          <source
+            type="image/webp"
+            sizes="(max-width: 1200px) 100vw, 1152px"
+            srcSet="/globe-wireframe-1024.webp 1024w, /globe-wireframe-1536.webp 1536w, /globe-wireframe.webp 2048w"
+          />
           <img
             src="/globe-wireframe.png"
             alt=""
