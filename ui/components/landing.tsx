@@ -79,7 +79,24 @@ function IntroLoader() {
       return;
     }
     introPlayed = true;
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    // Skip the intro outright on a connection that is already known to be
+    // slow. The overlay is a fixed ~2.75s of full-screen black, so on a slow
+    // link it was pure added latency on top of whatever the network was
+    // already costing — the visitor stared at black while the hero they had
+    // already downloaded sat underneath it. The hero is prerendered (see
+    // home-client.tsx), so skipping costs nothing but reveals it immediately.
+    // Deliberately conservative: only an explicitly slow/metered signal skips
+    // it, so the normal case keeps the designed intro.
+    const conn = (
+      navigator as Navigator & {
+        connection?: { effectiveType?: string; saveData?: boolean };
+      }
+    ).connection;
+    const slow =
+      conn?.saveData === true ||
+      (typeof conn?.effectiveType === "string" &&
+        ["slow-2g", "2g", "3g"].includes(conn.effectiveType));
+    if (slow || window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
       setPhase("done");
       return;
     }

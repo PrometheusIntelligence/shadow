@@ -1,52 +1,58 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { GLOBE_TRACERS_SVG } from "@/components/globe-tracers";
 
 /**
- * The hero globe wireframe — a SINGLE inlined SVG whose SIZE is owned entirely by
- * CSS (so it can never fall back to its intrinsic 2048px size and shift left).
+ * The hero globe: a raster globe image with the animated tracer overlay drawn
+ * on top. Both halves are DECLARATIVE — no fetch, no effect, no JavaScript —
+ * so the globe is discovered and fetched by the browser while it parses the
+ * HTML, in parallel with the JS bundle, instead of after hydration.
  *
- * The blue tracer animation is ALWAYS on: the SMIL timeline runs from load, in
- * full color, with no interaction gating. The only JS here strips the SVG's
- * intrinsic width/height so CSS can own sizing.
+ * The reason this used to be a `fetch()` inside a `useEffect` was that the
+ * artwork shipped as one 906,804-byte `/globe-wireframe.svg` whose 2048x762
+ * globe raster was embedded as a base64 `data:image/png` — 904,850 of its
+ * bytes. That made it 886 KB on the wire (gzip could not help: the PNG is
+ * already compressed and base64 inflates it a further 33%), slow enough that
+ * it visibly arrived late on a slow connection, and it was requested only
+ * once React had mounted. Worst of all, the failure path was `.catch(() => {})`
+ * — a failed or timed-out fetch left this region permanently blank with no
+ * placeholder and no signal, which is the "loads inconsistently" symptom.
+ *
+ * Now: the raster is its own cacheable image (WebP lossless, 405 KB, with a
+ * PNG fallback) and the ~21 KB of tracer markup ships with the component. The
+ * tracers are in the live document so their SMIL timeline animates, and they
+ * paint immediately — so even before the raster arrives the hero shows the
+ * globe's light routes rather than an empty box.
  */
 export function GlobeWireframe({ className }: { className?: string }) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const [markup, setMarkup] = useState<string | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    fetch("/globe-wireframe.svg")
-      .then((r) => r.text())
-      .then((t) => {
-        if (!active) return;
-        const cleaned = t
-          // Strip the XML prolog + the root <svg>'s intrinsic width/height so it
-          // can never render at its 2048px natural size; CSS owns sizing.
-          .replace(/<\?xml[^>]*\?>/, "")
-          .replace(/(<svg\b[^>]*?)\s+width="[^"]*"/, "$1")
-          .replace(/(<svg\b[^>]*?)\s+height="[^"]*"/, "$1");
-        setMarkup(cleaned);
-      })
-      .catch(() => {});
-    return () => {
-      active = false;
-    };
-  }, []);
-
   return (
     <div className={className}>
-      {/* Fixed aspect-ratio box → the SVG's containing block is a definite size. */}
+      {/* Fixed aspect-ratio box → both layers have a definite containing
+          block, so nothing can render at the artwork's intrinsic 2048px and
+          shift the layout. */}
       <div className="relative w-full overflow-hidden" style={{ aspectRatio: "2048 / 762" }}>
-        {markup && (
-          <div
-            ref={hostRef}
+        {/* WebP first (lossless, 405 KB) with the optimized PNG as the
+            fallback for anything without WebP. `fetchPriority="high"` tells
+            the browser this is hero-critical rather than a late-discovered
+            image; without the fetch() it is discovered during HTML parse. */}
+        <picture>
+          <source srcSet="/globe-wireframe.webp" type="image/webp" />
+          <img
+            src="/globe-wireframe.png"
+            alt=""
             aria-hidden="true"
-            // CSS owns sizing (overrides the SVG's width/height attributes).
-            className="pointer-events-none absolute inset-0 select-none [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
-            dangerouslySetInnerHTML={{ __html: markup }}
+            width={2048}
+            height={762}
+            fetchPriority="high"
+            decoding="async"
+            className="pointer-events-none absolute inset-0 block h-full w-full select-none"
           />
-        )}
+        </picture>
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 select-none [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
+          dangerouslySetInnerHTML={{ __html: GLOBE_TRACERS_SVG }}
+        />
       </div>
     </div>
   );

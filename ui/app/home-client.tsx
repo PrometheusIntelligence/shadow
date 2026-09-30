@@ -46,23 +46,27 @@ export function HomeClient() {
 function GuardedHome() {
   const view = useSettledAuth();
   if (view === "in") return <Dashboard />;
-  if (view === "out") return <Landing />;
   if (view === "degraded") return <AuthDegraded />;
-  return <AuthResolving />;
-}
-
-/** Neutral third state while auth is genuinely unresolved: deliberately
- *  NEITHER the Landing NOR the Dashboard, so an unsettled auth signal can
- *  never paint the wrong app even once. On the force-dynamic home route
- *  Clerk's SSR resolves auth before first paint, so a normal visitor never
- *  sees this; it exists for the pathological path (slow/blocked clerk-js),
- *  and is time-bounded by the guard (RESOLVE_TIMEOUT_MS → signed-out). */
-function AuthResolving() {
-  return (
-    <div aria-busy="true" className="flex min-h-[70vh] items-center justify-center">
-      <span className="h-8 w-8 animate-pulse rounded-full border border-border bg-subtle" />
-    </div>
-  );
+  // "out" AND the not-yet-resolved state both render the Landing.
+  //
+  // This used to render a bare spinner while auth was unresolved, which made
+  // the prerendered `/` an essentially EMPTY page (24 KB: title + an
+  // `aria-busy` placeholder, no hero, no globe) and put the entire landing
+  // behind a chain of HTML -> JS bundle -> hydration -> Clerk's THIRD-PARTY
+  // script resolving -> render. On a slow connection that last hop is an
+  // indeterminate round trip to accounts.dev, and the guard would wait up to
+  // RESOLVE_TIMEOUT_MS (8s) before settling — which is exactly the reported
+  // "the planet loads inconsistently, especially on slow networks".
+  //
+  // The Landing is identical for every visitor (no per-request data), so it is
+  // safe to show before auth is known and it can therefore be PRERENDERED:
+  // the hero, the CTAs and the globe are now in the initial HTML. Only the
+  // signed-in Dashboard needs the auth decision, and the guard's hysteresis
+  // plus flip bound still apply to that one transition, so an oscillating
+  // signal cannot thrash landing<->dashboard (the failure this guard exists
+  // for). The cost is that a signed-in user may see the landing briefly
+  // before the dashboard — strictly better than everyone seeing a blank page.
+  return <Landing />;
 }
 
 /** Terminal state after the guard's flip bound tripped: the auth signal on

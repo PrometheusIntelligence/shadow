@@ -164,6 +164,8 @@ const nextConfig = {
     // to LANDING_CACHE in proxy.ts (the middleware is what actually sets the
     // header; this entry is the backstop for when the matcher doesn't match).
     const LANDING_CACHE = "public, max-age=60, s-maxage=300, stale-while-revalidate=300";
+    // Static /public artwork (see the header rule below for why it needs one).
+    const STATIC_ASSET_CACHE = "public, max-age=86400, s-maxage=604800, stale-while-revalidate=604800";
     const cc = (value) => [{ key: "Cache-Control", value }];
     const noStorePaths = [
       "/account/:path*",
@@ -284,6 +286,18 @@ const nextConfig = {
       },
       // Immutable hashed build assets — cache for a year.
       { source: "/_next/static/:path*", headers: cc("public, max-age=31536000, immutable") },
+      // Static artwork in /public. These fell through EVERY rule above —
+      // `publicPaths` only lists page routes, and the catch-all below is
+      // deliberately anchored with `[^.]*` so it skips anything containing a
+      // dot — so they were served with Next's `public/` default of
+      // `max-age=0` and re-downloaded on every single visit. The hero globe
+      // alone is ~405 KB, so that made every cold load pay it again.
+      // Not `immutable`: these names are not content-hashed, so a bounded
+      // max-age plus a long stale-while-revalidate is the honest choice.
+      {
+        source: "/:file((?:globe-wireframe|globe-dark|globe-light)\\.(?:webp|png|svg))",
+        headers: cc(STATIC_ASSET_CACHE),
+      },
       // Sensitive / dynamic management surfaces — never cache.
       ...noStorePaths.map((source) => ({ source, headers: cc(NO_STORE) })),
       // The landing route: same value as proxy.ts's LANDING_CACHE.
