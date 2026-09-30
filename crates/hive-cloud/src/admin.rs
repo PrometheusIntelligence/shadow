@@ -7035,6 +7035,24 @@ const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
 /// still merged on the next poll, exactly as it was when it missed 8s.
 const POLLED_READ_PER_PEER_BUDGET: Duration = Duration::from_secs(3);
 
+/// TTL for the dashboard-polled response caches (`/v1/functions`,
+/// `/v1/metrics`) — and REQUIRED to be larger than the time it takes to BUILD
+/// an entry, or the cache can never be hit at all.
+///
+/// Live-witnessed 2026-09-30: both endpoints cost 3.0028 s on the control-
+/// plane leader (fc-sanjose) — exactly `POLLED_READ_PER_PEER_BUDGET`, i.e. one
+/// unreachable-but-healthy-listed peer burning the whole fan-out budget. With a
+/// 3 s TTL the entry was therefore ALREADY expired the instant it was stored,
+/// so every single poll paid the full fan-out and the cache did nothing. It
+/// looked like it worked because fc-phoenix, whose build costs 0.46 s, really
+/// did hit it (0.0004 s on a repeat call) — a node whose build is slower than
+/// the TTL silently gets no caching whatsoever. Since the dashboard's `/ops/*`
+/// proxy forwards to the leader, the slow node is the one users actually hit.
+///
+/// 15 s is >4x the measured worst-case build: metrics are minute-granular, so
+/// that staleness is invisible, and the functions list only changes on a deploy.
+const POLLED_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(15);
+
 /// Fan out `path` (identical for every peer — only the target host varies) to
 /// every node in `peers` CONCURRENTLY, returning each reachable peer's parsed
 /// JSON response (unreachable/malformed peers are silently absent — never
@@ -8380,7 +8398,10 @@ pub async fn functions(
     let is_top_level = q.local != Some(true);
     let cache_key = format!("functions:{t}:{}", internal);
     if is_top_level {
-        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(3)) {
+        if let Some(v) = c
+            .resp_cache
+            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
+        {
             return Json(v);
         }
     }
@@ -13936,7 +13957,10 @@ async fn metrics_get(
         project.unwrap_or("")
     );
     if is_top_level {
-        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(3)) {
+        if let Some(v) = c
+            .resp_cache
+            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
+        {
             return Json(v);
         }
     }
