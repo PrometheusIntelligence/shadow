@@ -16,6 +16,22 @@
 //! this node's OWN view is fresh (some target answered within
 //! [`VIEW_FRESH_MS`]): a node that reaches nobody sees every target as silent,
 //! and it must keep dialing every one of them, seeds above all, every round.
+//!
+//! Ending at a deadline is not enough on its own. A target's own dial budget
+//! (`hive_p2p::dial_fallback_ceiling`, 14 s on the fleet) is LONGER than the
+//! round deadline, so one target that never answers still held every round to
+//! the full 8 s — measured fleet-wide as `collect_p50=8000` with a deadline
+//! hit on 45 of 47 rounds. The dead-target backoff above cannot help there:
+//! [`Rounds::admit`] deliberately never backs off a target another node still
+//! gossips about, and the undialable ones (behind NAT, reached only through a
+//! relay) are exactly the ones whose relayed `last_seen_ms` stays fresh.
+//! So the round also gets a per-target LEASH: after
+//! [`LEASH_AFTER_ROUNDS`] consecutive missed deadlines a target is dialed
+//! exactly as often as before, but the round waits only
+//! [`straggler_leash_ms`] for it (see `bounded_round::collect_leashed`).
+//! Parking is never cancellation, never a skip, and never a withdrawal: the
+//! sync keeps running, its result still lands (one round late at worst), and
+//! one answer inside the round restores the full deadline immediately.
 
 use hive_core::now_ms;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +52,12 @@ const BACKOFF_FIRST_MS: u64 = 60_000;
 /// Inside the mesh's three-minute bound on anything being undialable (the
 /// PeerPool caps): 60 s, 120 s, then 180 s.
 const BACKOFF_MAX_MS: u64 = 180_000;
+/// Consecutive rounds in which a target was dispatched and did NOT report
+/// before the round ended, after which the round stops giving it the full
+/// deadline ([`straggler_leash_ms`] instead). Two, never one: "one stale
+/// reading never withdraws one" — a single slow round is a network event, a
+/// second one in a row is a target that is not answering.
+const LEASH_AFTER_ROUNDS: u32 = 2;
 /// Round percentiles are logged (and the margin checked) this often.
 const LOG_EVERY_MS: u64 = 600_000;
 const MAX_SAMPLES: usize = 4096;
@@ -53,6 +75,8 @@ static RESYNC_P99_MS: AtomicU64 = AtomicU64::new(0);
 static DEADLINE_HITS: AtomicU64 = AtomicU64::new(0);
 static STRAGGLERS: AtomicU64 = AtomicU64::new(0);
 static BACKED_OFF: AtomicU64 = AtomicU64::new(0);
+/// Targets the round currently waits only [`straggler_leash_ms`] for.
+static LEASHED: AtomicU64 = AtomicU64::new(0);
 
 /// `HIVE_GOSSIP_ROUND_DEADLINE_MS` (default 8000): how long a round waits for
 /// its targets before it merges what it has.
@@ -63,6 +87,20 @@ pub fn deadline() -> Duration {
         .filter(|&v| v > 0)
         .unwrap_or(8_000);
     Duration::from_millis(ms)
+}
+
+/// `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (default 2500): how long a round waits
+/// for one target that has already missed the round deadline
+/// [`LEASH_AFTER_ROUNDS`] times running. Comfortably above a healthy gossip
+/// sync (a two-request exchange over a warm trunk, measured 70-550 ms per
+/// request fleet-wide) and far below the 8 s deadline, so it parks targets
+/// that are not answering without ever parking one that is.
+pub fn straggler_leash_ms() -> u64 {
+    std::env::var("HIVE_GOSSIP_STRAGGLER_LEASH_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(2_500)
 }
 
 /// Monotonic ms since first use (never 0): a wall-clock step can neither fake
@@ -101,9 +139,27 @@ struct TargetState {
     identity: Option<String>,
 }
 
+/// The endpoint a target names: `seed:<64hex>` and `<64hex>` are the same one.
+fn endpoint_key(target: &str) -> &str {
+    target.strip_prefix("seed:").unwrap_or(target)
+}
+
 /// Loop-owned round state (single writer: the gossip loop).
 pub struct Rounds {
     targets: HashMap<String, TargetState>,
+    /// Per ENDPOINT, consecutive rounds in which it was dispatched and did not
+    /// report before the round ended, plus the epoch-ms it was last counted.
+    /// At [`LEASH_AFTER_ROUNDS`] the round stops giving that endpoint the full
+    /// deadline; a single report inside a round clears it.
+    ///
+    /// Keyed by ENDPOINT ID, never by the target's label: `seed:<64hex>` and
+    /// the bare `<64hex>` roster entry are two labels for ONE endpoint (both
+    /// are dialed every round), and a relayed registry entry that blinks for a
+    /// round drops its label from the candidate set entirely — keyed on the
+    /// label, the count restarted on both, so an endpoint that never answers
+    /// re-bought the full deadline every few rounds (measured: 6 re-acquires
+    /// of one target in 25 min on fc-virginia-3).
+    slow: HashMap<String, (u32, u64)>,
     /// Epoch-ms some target last answered (0 = none yet).
     last_reached_ms: u64,
     /// [`mono_ms`] the current round started (0 = none yet).
@@ -143,6 +199,7 @@ impl Rounds {
         LAST_ROUND_MONO_MS.store(mono_ms(), Ordering::Relaxed);
         Self {
             targets: HashMap::new(),
+            slow: HashMap::new(),
             last_reached_ms: 0,
             round_start_mono: 0,
             period: Vec::new(),
@@ -210,9 +267,61 @@ impl Rounds {
         true
     }
 
+    /// How long the round waits for `target` this round: `None` = the round
+    /// deadline is the only bound, `Some(ms)` = a leash, measured by
+    /// `bounded_round` from the moment the target was dispatched.
+    ///
+    /// Leashed only after [`LEASH_AFTER_ROUNDS`] consecutive missed deadlines
+    /// AND only while this node's own view is fresh — while it reaches nobody,
+    /// the silence is this node's, and shortening its waits would only make a
+    /// local transport fault look like every peer being slow.
+    pub fn leash_ms(&self, target: &str, now: u64) -> Option<u64> {
+        let missed = self
+            .slow
+            .get(endpoint_key(target))
+            .map(|(n, _)| *n)
+            .unwrap_or(0);
+        if missed < LEASH_AFTER_ROUNDS || !self.view_fresh(now) {
+            return None;
+        }
+        let ms = straggler_leash_ms().min((deadline().as_millis() as u64).saturating_sub(1));
+        (ms > 0).then_some(ms)
+    }
+
+    /// `target` was dispatched this round and had not reported when the round
+    /// ended. Two of those in a row and the round stops waiting the full
+    /// deadline for that endpoint — it is still dialed every single round.
+    pub fn note_straggler(&mut self, target: &str, now: u64) {
+        let e = self.slow.entry(endpoint_key(target).to_string()).or_insert((0, now));
+        if e.0 >= LEASH_AFTER_ROUNDS {
+            e.1 = now;
+            return;
+        }
+        e.0 = e.0.saturating_add(1);
+        e.1 = now;
+        if e.0 == LEASH_AFTER_ROUNDS {
+            tracing::info!(
+                target,
+                leash_ms = straggler_leash_ms(),
+                "gossip target missed the round deadline twice running — the round now waits at \
+                 most that long for it, and still dials it every round (parked, never cancelled, \
+                 never withdrawn)"
+            );
+        }
+    }
+
     /// A dispatched target's sync ended (`reached` = the peer answered, as
-    /// `identity` when its roster named itself).
-    pub fn finished(&mut self, target: &str, reached: bool, identity: Option<String>, now: u64) {
+    /// `identity` when its roster named itself). `timely` = it reported inside
+    /// the round it was dispatched in; a result that landed late still counts
+    /// as a missed round, since the round had to end without it.
+    pub fn finished(
+        &mut self,
+        target: &str,
+        reached: bool,
+        identity: Option<String>,
+        now: u64,
+        timely: bool,
+    ) {
         if reached {
             if !self.view_fresh(now) {
                 // The first answer after a blind stretch: our own transport
@@ -239,6 +348,17 @@ impl Rounds {
         let Some(st) = self.targets.get_mut(target) else {
             return;
         };
+        if timely {
+            if let Some((n, _)) = self.slow.remove(endpoint_key(target)) {
+                if n >= LEASH_AFTER_ROUNDS {
+                    tracing::info!(
+                        target,
+                        "gossip target answered inside the round again — full round deadline \
+                         restored"
+                    );
+                }
+            }
+        }
         if reached {
             if st.backoff_ms > 0 {
                 tracing::info!(
@@ -313,8 +433,24 @@ impl Rounds {
             .filter(|st| st.backoff_ms > 0 && Self::dead(st, now, view_fresh))
             .count();
         BACKED_OFF.store(backed_off as u64, Ordering::Relaxed);
+        // Forget endpoints this loop has not had to wait for in DEAD_AFTER_MS:
+        // the map is one entry per endpoint ever dialed, so a node that leaves
+        // the fleet must not leave leash state behind forever.
+        self.slow
+            .retain(|_, (_, seen)| now.saturating_sub(*seen) < DEAD_AFTER_MS);
+        // Only counted as leashed while this node's own view is fresh: outside
+        // it the leash is held back too (`leash_ms`) and nothing is parked.
+        let leashed = if view_fresh {
+            self.slow
+                .values()
+                .filter(|(n, _)| *n >= LEASH_AFTER_ROUNDS)
+                .count()
+        } else {
+            0
+        };
+        LEASHED.store(leashed as u64, Ordering::Relaxed);
         if now.saturating_sub(self.window_start_ms) >= LOG_EVERY_MS && !self.period.is_empty() {
-            self.log_window(backed_off);
+            self.log_window(backed_off, leashed);
             self.period.clear();
             self.collect.clear();
             self.resync.clear();
@@ -327,7 +463,7 @@ impl Rounds {
         resumed
     }
 
-    fn log_window(&mut self, backed_off: usize) {
+    fn log_window(&mut self, backed_off: usize, leashed: usize) {
         let rounds = self.period.len();
         let (p50, p99) = percentiles(&mut self.period);
         let (collect_p50, collect_p99) = percentiles(&mut self.collect);
@@ -350,6 +486,8 @@ impl Rounds {
             in_flight_skips = self.window_in_flight_skips,
             backoff_skips = self.window_backoff_skips,
             backed_off_targets = backed_off,
+            leashed_targets = leashed,
+            leash_ms = straggler_leash_ms(),
             "gossip rounds (last 10 min)"
         );
         // The round period is start to start (collect + post-round work +
@@ -389,5 +527,7 @@ pub fn stats() -> serde_json::Value {
         "deadline_hits": DEADLINE_HITS.load(Ordering::Relaxed),
         "stragglers": STRAGGLERS.load(Ordering::Relaxed),
         "backed_off_targets": BACKED_OFF.load(Ordering::Relaxed),
+        "leashed_targets": LEASHED.load(Ordering::Relaxed),
+        "straggler_leash_ms": straggler_leash_ms(),
     })
 }

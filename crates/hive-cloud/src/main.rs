@@ -4469,11 +4469,18 @@ fn spawn_gossip_loop(
             // flag (never dispatched twice at once; `bounded_round`), and a target
             // nobody has heard from for 10 min — while other targets answer — is
             // dialed on a 1 -> 3 min backoff (`gossip_round::Rounds`).
+            // A target that has missed the round deadline twice running gets a
+            // short per-target leash instead of the full deadline: the round
+            // stops waiting for it (it is parked, never cancelled, never
+            // withdrawn) while it is still dialed every round, so the moment
+            // it answers again it is picked up — inside the round if it beats
+            // the leash, one round later if it beats only the old deadline.
             rounds.begin_round();
             let round_deadline = tokio::time::Instant::now() + crate::gossip_round::deadline();
             // Stragglers of earlier rounds that finished since: their flags are
             // already clear, so they are dispatched again below.
             let mut landed = fanout.begin();
+            let round_id = fanout.round();
             let me = cloud.registry.me();
             let me_bytes = serde_json::to_vec(&me).unwrap_or_default();
             let mut dispatched = 0usize;
@@ -4492,15 +4499,29 @@ fn spawn_gossip_loop(
                 }
             }
             let collect_started = std::time::Instant::now();
-            let (more, stragglers) = fanout.collect(round_deadline).await;
+            let (more, stragglers) = fanout
+                .collect_leashed(round_deadline, |t: &str| rounds.leash_ms(t, now_ms()))
+                .await;
             let collect_ms = (dispatched > 0).then(|| collect_started.elapsed().as_millis() as u64);
+            let now = now_ms();
+            for t in fanout.outstanding() {
+                rounds.note_straggler(&t, now);
+            }
             landed.extend(more);
             // Results arrive in order, so a target's later result replaces its earlier
-            // one; a target that failed drops its stand-in.
+            // one; a target that failed drops its stand-in. A result carrying this
+            // round's number reported inside the round; anything older is a
+            // straggler of an earlier one and counts as a missed round.
             let mut landed_now: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (rid, t, pr) in landed {
-                rounds.finished(&t, pr.reached, pr.node().map(str::to_string), now_ms());
+                rounds.finished(
+                    &t,
+                    pr.reached,
+                    pr.node().map(str::to_string),
+                    now_ms(),
+                    rid == round_id,
+                );
                 if pr.reached {
                     landed_now.insert(t.clone());
                     answers.insert(t, (rid, pr));
