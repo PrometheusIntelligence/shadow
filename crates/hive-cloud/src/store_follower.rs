@@ -284,12 +284,27 @@ fn adopt(
 /// locks, so it runs in a plain loop after the join.
 async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Target) {
     use futures::StreamExt as _;
+    // Where a store goes when it is NOT fetched here. With a large lane, a
+    // proven-large or suspect store belongs to that lane. Without one (a
+    // node that skips large stores, see `pulls_large_stores`) only a store
+    // PROVEN large by its size is skipped: a suspect mark is cleared solely
+    // by a large-lane pull, so on such a node it would park a small store
+    // for the life of the process. Witnessed 2026-09-30 right after the
+    // large-lane gate shipped: `docs` and `audit` hit the 10 s budget once
+    // on a saturated owner link and never replicated again on all six
+    // mock-backend nodes, and `projects` froze the same way on shadw3.
+    let large_lane = pulls_large_stores(cloud);
     let mut small: Vec<(&'static SyncedStore, Vec<u8>, usize)> = Vec::new();
     for store in store_sync::REGISTRY.iter().filter(|s| target.pulls(s)) {
         let local = (store.snapshot)(cloud);
         let mut sh = shared.lock();
         sh.lanes.observe_local(store.name, local.len());
-        if sh.lanes.in_lane(store.name) {
+        let skip = if large_lane {
+            sh.lanes.in_lane(store.name)
+        } else {
+            sh.lanes.proven_large(store.name)
+        };
+        if skip {
             continue;
         }
         drop(sh);
@@ -325,7 +340,7 @@ async fn pull_batch(cloud: &Arc<CloudState>, shared: &SharedState, target: &Targ
         for &(store, ok, elapsed) in &outcomes {
             // Ran out the WHOLE budget while the trunk carried other stores:
             // the one batch failure that suggests size.
-            if !ok && !link_down && elapsed + Duration::from_millis(500) >= budget {
+            if large_lane && !ok && !link_down && elapsed + Duration::from_millis(500) >= budget {
                 sh.lanes.suspect(store);
             }
         }
@@ -449,6 +464,13 @@ impl StoreLanes {
     /// Whether the large lane owns this store: proven large or suspect.
     fn in_lane(&self, store: &str) -> bool {
         self.hint(store) > store_sync::LARGE_STORE_BYTES
+    }
+
+    /// Proven large by a measured size (the local copy or the last snapshot a
+    /// peer served), ignoring any suspect mark.
+    fn proven_large(&self, store: &str) -> bool {
+        let local_len = self.stores.get(store).map_or(0, |lane| lane.local_len);
+        store_sync::size_hint(store, local_len) > store_sync::LARGE_STORE_BYTES
     }
 
     fn due(&self, store: &str) -> bool {
