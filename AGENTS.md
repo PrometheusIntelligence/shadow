@@ -148,7 +148,14 @@ memories/notes whose durable content it absorbed.
 - **A gossip round never waits on a dead peer, and one stale reading never
   withdraws one.** Rounds end at `HIVE_GOSSIP_ROUND_DEADLINE_MS` (8000) using ONE
   fan-out primitive, `bounded_round::BoundedRound`, never a hand-rolled
-  `join_all`. A slow sync is LATE, never absent (`round_contributions`); backoff
+  `join_all`. The deadline alone let ONE slow target pin every round to the full
+  8s, so a target that has missed it `LEASH_AFTER_ROUNDS` (2) times running is
+  waited on only `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (2500) — still dialed every
+  round, and one answer inside the round restores the full deadline. A leash
+  PARKS, never cancels (the task keeps running, its result lands a round late),
+  so it can never cut a dial short mid-discovery; leash state is keyed by
+  ENDPOINT id, never target label (`seed:<64hex>` and bare `<64hex>` are one
+  endpoint). A slow sync is LATE, never absent (`round_contributions`); backoff
   applies only while this node's view is fresh; `health::demote` withdraws only
   after `DEMOTE_STALE_ROUNDS` (2) stale rounds and HOLDS while the loop is stalled.
 - meshwatch: total isolation (600s), cumulative degradation, and
