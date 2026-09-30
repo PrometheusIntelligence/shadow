@@ -61,6 +61,17 @@
     chdir: /tmp/fail2ban-1.1.0
   when: f2b_active.stdout != "active"
 
+# The unit must exec the fail2ban that is actually installed. A node that got
+# the distro RPM has it at /usr/bin, not /usr/local/bin where the source
+# install lands; hard-coding /usr/local/bin left fc-sanjose's fail2ban dead
+# for over a month (exit after 3 ms, since 2026-08-27, never noticed).
+- name: Locate the installed fail2ban-server and fail2ban-client
+  ansible.builtin.shell: |
+    set -e
+    printf '%s\n%s\n' "$(command -v fail2ban-server)" "$(command -v fail2ban-client)"
+  register: f2b_bins
+  changed_when: false
+
 - name: Install the fail2ban systemd unit
   ansible.builtin.copy:
     dest: /etc/systemd/system/fail2ban.service
@@ -82,9 +93,9 @@
       [Service]
       Type=simple
       ExecStartPre=/bin/mkdir -p /run/fail2ban
-      ExecStart=/usr/local/bin/fail2ban-server -xf start
-      ExecStop=/usr/local/bin/fail2ban-client stop
-      ExecReload=/usr/local/bin/fail2ban-client reload
+      ExecStart={{ f2b_bins.stdout_lines[0] }} -xf start
+      ExecStop={{ f2b_bins.stdout_lines[1] }} stop
+      ExecReload={{ f2b_bins.stdout_lines[1] }} reload
       PIDFile=/run/fail2ban/fail2ban.pid
       Restart=on-failure
       RestartPreventExitStatus=0 255
@@ -92,8 +103,73 @@
       [Install]
       WantedBy=multi-user.target
 
-- name: Install the sshd jail config -- explicit logpath/backend rather than
-    relying on fail2ban's own OS auto-detection (TencentOS is not a distro
+# Bans go through nftables. The fleet's firewall is nft-only (scripts/
+# hive-lockdown.sh), and Rocky 10 ships no `iptables` binary at all, so the
+# previous `iptables-multiport` banaction failed on every ban it attempted
+# (witnessed on fc-sanjose-7, 2026-09-30: `command -v iptables` empty).
+#
+# `mode = aggressive` for sshd. Password auth is off fleet-wide, so a scanner
+# never produces a "Failed password" line; what it produces is key probing
+# that ends in "Connection reset/closed by authenticating user ... [preauth]",
+# which the default `normal` mode does not count. Witnessed on fc-sanjose-7:
+# real probes from several IPs every few minutes, and the jail's counter at 0.
+#
+# ignoreip is derived from the inventory (every live host's public and
+# private address, retired hosts excluded) plus `hive_fail2ban_ignoreip_extra`
+# (the operator's egress, kept in the untracked inventory), so fail2ban can
+# never ban a fleet peer or lock the operator out mid-deploy.
+#
+# The recidive jail re-bans, on all ports and for a week, a source that keeps
+# getting banned; bantime.increment grows each repeat ban.
+  register: f2b_unit
+
+- name: Compute the fail2ban ignore list from the inventory
+  ansible.builtin.set_fact:
+    hive_fail2ban_ignoreip: >-
+      {{ (['127.0.0.1/8', '::1']
+          + (groups['all']
+             | map('extract', hostvars)
+             | rejectattr('hive_retired', 'defined')
+             | selectattr('ansible_host', 'defined')
+             | map(attribute='ansible_host') | list)
+          + (groups['all']
+             | map('extract', hostvars)
+             | rejectattr('hive_retired', 'defined')
+             | selectattr('hive_private_ip', 'defined')
+             | map(attribute='hive_private_ip') | list)
+          + (hive_fail2ban_ignoreip_extra | default('')).split(','))
+         | map('trim') | reject('equalto', '') | unique | join(' ') }}
+
+- name: Install jail.local (defaults + sshd + recidive)
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      banaction = nftables-multiport
+      banaction_allports = nftables-allports
+      bantime = 3600
+      bantime.increment = true
+      bantime.maxtime = 604800
+      findtime = 600
+      maxretry = 5
+      ignoreip = {{ hive_fail2ban_ignoreip }}
+
+      [sshd]
+      enabled = true
+      mode = aggressive
+
+      [recidive]
+      enabled = true
+      logpath = /var/log/fail2ban.log
+      banaction = nftables-allports
+      bantime = 604800
+      findtime = 86400
+      maxretry = 3
+  register: f2b_jail_local
+
+- name: Install the sshd jail source (explicit logpath/backend rather than
+    relying on fail2ban's own OS auto-detection -- TencentOS is not a distro
     fail2ban recognizes, so its default sshd_log path resolution misses;
     live-witnessed as "Have not found any log file for sshd jail" before
     this was made explicit)
@@ -103,34 +179,41 @@
     content: |
       [sshd]
       enabled = true
+      mode = aggressive
       port = ssh
       logpath = /var/log/secure
       backend = auto
-      maxretry = 5
-      bantime = 3600
-      findtime = 600
+  register: f2b_sshd_local
 
-- name: Install jail.local DEFAULTs (bantime/findtime/maxretry tuned for a
-    fleet the operator SSHes into from a stable but non-whitelisted IP --
-    long enough to deter scanning, short enough not to risk a real self-lockout)
+# OpenSSH 9.8+ (Rocky 10) logs from `sshd-session[pid]:`, not `sshd[pid]:`,
+# and fail2ban 1.1.0's sshd filter predates that split, so its prefix never
+# matched and the jail saw nothing at all. Witnessed on fc-sanjose-7
+# 2026-09-30: fail2ban-regex matched 0 of 164 real lines in either mode; with
+# this override aggressive mode matched 9 attack lines from 6 source IPs. The
+# group is optional, so older sshd builds keep matching exactly as before.
+- name: sshd filter accepts the sshd-session daemon name
   ansible.builtin.copy:
-    dest: /etc/fail2ban/jail.local
+    dest: /etc/fail2ban/filter.d/sshd.local
     mode: "0644"
     content: |
       [DEFAULT]
-      banaction = iptables-multiport
-      banaction_allports = iptables-allports
-      bantime = 3600
-      findtime = 600
-      maxretry = 5
+      _daemon = sshd(?:-session)?
+  register: f2b_filter_local
 
-      [sshd]
-      enabled = true
+- name: fail2ban writes its own log where the recidive jail reads it
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/fail2ban.local
+    mode: "0644"
+    content: |
+      [Definition]
+      logtarget = /var/log/fail2ban.log
+  register: f2b_main_local
 
-- name: Enable + start fail2ban
+- name: Enable + start fail2ban (restart when its config changed -- `started`
+    alone never re-reads a jail file on an already-running server)
   ansible.builtin.systemd:
     name: fail2ban
-    state: started
+    state: "{{ 'restarted' if (f2b_jail_local is changed or f2b_sshd_local is changed or f2b_main_local is changed or f2b_filter_local is changed or f2b_unit is changed) else 'started' }}"
     enabled: true
     daemon_reload: true
 
@@ -140,3 +223,12 @@
   register: f2b_jail_status
   changed_when: false
   failed_when: "'ERROR' in f2b_jail_status.stdout or 'ERROR' in f2b_jail_status.stderr"
+
+- name: Verify bans use nftables and both jails are up (fail loud)
+  ansible.builtin.shell: |
+    set -e
+    for _ in 1 2 3 4 5 6 7 8 9 10; do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
+    fail2ban-client status | grep -q 'sshd'
+    fail2ban-client status | grep -q 'recidive'
+    fail2ban-client get sshd actions | grep -q 'nftables'
+  changed_when: false

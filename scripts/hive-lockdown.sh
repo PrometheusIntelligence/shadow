@@ -25,7 +25,11 @@ PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
 # scripts/deploy-ui-fleet.sh already uses for its own host list), whenever a
 # node joins/leaves/changes IP. A hand-typed roster is exactly how this list
 # went stale the first time (6 of 12 current nodes, missing every GPU/CVM node).
-PEERS="43.152.247.70 43.128.46.225 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 43.173.78.95 43.153.114.15 43.172.117.92 43.135.132.93 43.172.117.25 170.106.177.140 43.166.76.159 162.62.83.144 43.166.223.197 43.166.233.114 93.188.162.67 43.133.30.68 150.109.247.150 170.106.162.175 43.130.153.237 43.153.106.173 170.106.155.130 162.62.83.91"
+PEERS="43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 170.106.177.140 93.188.162.67"
+# Fleet nodes' PRIVATE (VPC/CCN) addresses, from `hive_private_ip=` in the same
+# inventory. A peer reaching this node over the private path arrives with this
+# source, never its public IP, so strict mode (below) must know both.
+PRIVATE_PEERS="10.0.0.8 10.0.0.10 10.0.0.12 10.0.0.14"
 # 50052 = llama.cpp rpc-server on the GPU nodes (ggml RPC backend, NO
 # authentication of its own -- must never be internet-reachable; peers only).
 # 50100:50999 = managed-inference llama-server endpoints (inference.rs) --
@@ -61,4 +65,50 @@ elif command -v nft >/dev/null 2>&1; then
   echo "lockdown applied via nftables"
 else
   echo "ERROR: neither iptables nor nft found" >&2; exit 1
+fi
+
+# STRICT inbound, opt-in per host (`hive_lockdown_strict: true` in the
+# inventory drops /etc/hive/lockdown-strict). The table above is policy-ACCEPT:
+# it only blocks a short list of known-dangerous ports, so anything else a
+# process binds on 0.0.0.0 is reachable by whatever the cloud security group
+# lets through -- and Tencent's default group opens EVERY port to the whole
+# private address space, which in a shared account includes other people's
+# instances. Strict mode is default-DENY on the internet-facing interface only
+# (the one carrying the default route): container bridges, litebox TUNs and
+# loopback are untouched. It admits established traffic, fleet peers (public
+# and private addresses), ICMP, and the ports that are public BY DESIGN:
+#   TCP 22 ssh, 80 ACME/redirect, 443 HTTPS, 53 Seer, 5432/6379 the TLS
+#   database gateway, 20000-29999 tenant raw ports; UDP 53 Seer, 11204 iroh
+#   QUIC mesh, 20000-29999 tenant raw ports.
+# A separate table at a later priority, so the fleet table above keeps working
+# unchanged and fail2ban's own table (priority -1) still drops banned sources.
+STRICT_FLAG=/etc/hive/lockdown-strict
+STRICT_PUBLIC_TCP="22 80 443 53 5432 6379 20000:29999"
+STRICT_PUBLIC_UDP="53 11204 20000:29999"
+if command -v nft >/dev/null 2>&1; then
+  nft delete table inet hive_strict 2>/dev/null || true
+fi
+if [ -f "$STRICT_FLAG" ]; then
+  command -v nft >/dev/null 2>&1 || { echo "ERROR: strict lockdown requested ($STRICT_FLAG) but nft is not installed" >&2; exit 1; }
+  WAN_IF="$(ip -o route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+  [ -n "$WAN_IF" ] || { echo "ERROR: strict lockdown: no default-route interface found" >&2; exit 1; }
+  STRICT_PEERS="$(echo $PEERS $PRIVATE_PEERS | tr ' ' ',')"
+  TCP_PUBLIC="$(echo "$STRICT_PUBLIC_TCP" | tr ' :' ',-')"
+  UDP_PUBLIC="$(echo "$STRICT_PUBLIC_UDP" | tr ' :' ',-')"
+  nft -f - <<NFT || { echo "ERROR: strict lockdown ruleset failed to load" >&2; exit 1; }
+table inet hive_strict {
+  chain input {
+    type filter hook input priority -90; policy accept;
+    iifname != "$WAN_IF" accept
+    ct state established,related accept
+    ct state invalid drop
+    ip saddr { $STRICT_PEERS } accept
+    meta l4proto { icmp, ipv6-icmp } accept
+    tcp dport { $TCP_PUBLIC } accept
+    udp dport { $UDP_PUBLIC } accept
+    counter drop
+  }
+}
+NFT
+  echo "strict inbound lockdown applied on $WAN_IF"
 fi

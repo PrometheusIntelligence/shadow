@@ -23,3 +23,10 @@ hive_runsc_version: "20260727.0"
 # which is the correct direction for a sandbox binary.
 hive_runsc_sha512:
   x86_64: "ab99ea1b0e2d169ec95473ea6c44abdac9b6b63d9c483f898487fd2b3c32d63bfa9ea104a3d5eed217b90cfc880ceb7a1130a9f7daef6e50656b6e028a8f52e3"
+
+# Strict inbound lockdown (default-deny on the internet-facing interface; see
+# scripts/hive-lockdown.sh). Opt-in per host in the inventory.
+hive_lockdown_strict: false
+
+# Cockpit off, loose rp_filter, sshd hardening drop-in. Safe on every node.
+hive_host_hardening: true

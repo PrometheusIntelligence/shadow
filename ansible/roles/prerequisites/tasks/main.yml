@@ -108,6 +108,22 @@
       WantedBy=multi-user.target
   tags: [lockdown]
 
+- name: /etc/hive exists (holds the strict-lockdown flag)
+  ansible.builtin.file:
+    path: /etc/hive
+    state: directory
+    mode: "0755"
+  tags: [lockdown]
+
+- name: Strict inbound lockdown flag (hive_lockdown_strict; see scripts/hive-lockdown.sh)
+  ansible.builtin.file:
+    path: /etc/hive/lockdown-strict
+    state: "{{ 'touch' if hive_lockdown_strict | bool else 'absent' }}"
+    mode: "0644"
+    modification_time: preserve
+    access_time: preserve
+  tags: [lockdown]
+
 - name: Enable + run hive-lockdown now
   ansible.builtin.systemd:
     name: hive-lockdown
@@ -115,6 +131,103 @@
     enabled: true
     daemon_reload: true
   tags: [lockdown]
+
+# Host hardening that every node gets. Each item is safe fleet-wide:
+# - Cockpit ships enabled on Rocky 10 (cockpit.socket on :9090) and accepts
+#   PASSWORD logins for root, which Tencent images give a console password.
+#   Nothing in the fleet uses it.
+# - rp_filter=2 (loose) drops spoofed sources without breaking the
+#   asymmetric paths a 1:1-NAT cloud host and its TUN/bridge interfaces use.
+# - sshd: key-only root, no X11/GSSAPI, short login grace, idle-client
+#   timeout. MaxAuthTries is deliberately NOT lowered: operators' SSH agents
+#   offer several keys and would hit "Too many authentication failures".
+#   The drop-in is named 00- because sshd keeps the FIRST value it reads and
+#   the images ship 01-permitrootlogin.conf (yes) and 50-redhat.conf (X11 yes).
+- name: Disable + mask Cockpit (web console with root password login)
+  ansible.builtin.systemd:
+    name: cockpit.socket
+    state: stopped
+    enabled: false
+    masked: true
+  failed_when: false
+  when: hive_host_hardening | bool
+  tags: [hardening]
+
+- name: Reverse-path filtering (loose)
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-hive-hardening.conf
+    mode: "0644"
+    content: |
+      net.ipv4.conf.all.rp_filter = 2
+      net.ipv4.conf.default.rp_filter = 2
+  register: hive_hardening_sysctl
+  when: hive_host_hardening | bool
+  tags: [hardening]
+
+- name: Apply hardening sysctls
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/90-hive-hardening.conf
+  when: hive_host_hardening | bool and hive_hardening_sysctl is changed
+  tags: [hardening]
+
+# iroh asks the kernel for a 7 MiB UDP socket buffer and gets at most
+# 2 x rmem_max. At the distro default (212992) the mesh socket was clamped to
+# 416 KiB and dropped datagrams under load: UdpRcvbufErrors of 39-200 per
+# 10 min on the followers, 0 after raising it (2026-09-30). The socket buffer
+# is sized at bind time, so hive-node must restart once to pick it up.
+- name: Mesh UDP socket buffer ceiling
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-hive-udp.conf
+    mode: "0644"
+    content: |
+      net.core.rmem_max = 8388608
+      net.core.wmem_max = 8388608
+      net.core.netdev_max_backlog = 5000
+  register: hive_udp_sysctl
+  tags: [hardening]
+
+- name: Apply the mesh UDP buffer sysctls
+  ansible.builtin.command: sysctl -p /etc/sysctl.d/90-hive-udp.conf
+  when: hive_udp_sysctl is changed
+  tags: [hardening]
+
+- name: sshd hardening drop-in
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-hive-hardening.conf
+    mode: "0600"
+    # The fragment is syntax-checked on its own here; the task after it
+    # checks the EFFECTIVE merged config with `sshd -T`.
+    validate: /usr/sbin/sshd -t -f %s
+    content: |
+      PermitRootLogin prohibit-password
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitEmptyPasswords no
+      X11Forwarding no
+      GSSAPIAuthentication no
+      LoginGraceTime 30
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+  register: hive_sshd_hardening
+  when: hive_host_hardening | bool
+  tags: [hardening]
+
+- name: Verify sshd picked up the hardening (fail loud if an earlier drop-in wins)
+  ansible.builtin.shell: |
+    set -e
+    out="$(sshd -T)"
+    echo "$out" | grep -qx 'permitrootlogin without-password' || echo "$out" | grep -qx 'permitrootlogin prohibit-password'
+    echo "$out" | grep -qx 'passwordauthentication no'
+    echo "$out" | grep -qx 'x11forwarding no'
+  changed_when: false
+  when: hive_host_hardening | bool
+  tags: [hardening]
+
+- name: Reload sshd (existing sessions survive a reload)
+  ansible.builtin.systemd:
+    name: sshd
+    state: reloaded
+  when: hive_host_hardening | bool and hive_sshd_hardening is changed
+  tags: [hardening]
 
 - name: Create hive data + run directories
   ansible.builtin.file:
