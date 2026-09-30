@@ -29,8 +29,12 @@
 # Usage:
 #   scripts/audit-public-listeners.sh            # table for the whole fleet
 #   SSH_KEY=~/.ssh/other.pem scripts/audit-public-listeners.sh
+#   ONLY=fc-sanjose-7 scripts/audit-public-listeners.sh   # just these hive_names
+#                                    # (comma-separated); the roster is still
+#                                    # checked against the WHOLE inventory's size
 # Exit status is 1 when any node reports a foreign listener, so it can gate a
-# rollout or run from cron.
+# rollout or run from cron. ONLY exists so a freshly provisioned node can be
+# gated on its own while powered-off inventory hosts answer UNREACHABLE.
 set -uo pipefail
 
 INVENTORY="${INVENTORY:-$(dirname "$0")/../ansible/inventory/hosts.ini}"
@@ -94,6 +98,7 @@ printf "%.0s-" {1..100} && echo
 bad=0
 while IFS=$'\t' read -r name ip; do
   [ -z "$name" ] && continue
+  if [ -n "${ONLY:-}" ] && [[ ",${ONLY}," != *",${name},"* ]]; then continue; fi
   out=$(probe "$ip")
   if [ -z "$out" ]; then
     printf "%-20s %-16s %-16s %s\n" "$name" "$ip" UNREACHABLE -

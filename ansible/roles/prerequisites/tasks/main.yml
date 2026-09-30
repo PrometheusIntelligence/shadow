@@ -426,8 +426,14 @@
   # `failed_when: false` above means rc != 0 covers BOTH "absent" and
   # "present but not runnable" (a broken install), and both are worth
   # replacing here.
+  # `--prefix /usr/local` pins the shims to /usr/local/bin, which is on the
+  # hive-node unit's PATH. Without it npm uses node's OWN prefix: on a fresh
+  # host that got node from the v22.23.2 tarball above that is
+  # /usr/local/node-v22.23.2-linux-x64/bin, which is on no PATH, so the verify
+  # task below failed "No such file or directory: pnpm" (fc-sanjose-7,
+  # 2026-09-30) and the build lane would never see pnpm/yarn.
   when: item.rc != 0
-  ansible.builtin.command: "npm install -g {{ item.item.pkg }}"
+  ansible.builtin.command: "npm install -g --prefix /usr/local {{ item.item.pkg }}"
   loop: "{{ hive_npm_pm_check.results }}"
   loop_control:
     label: "{{ item.item.tool }}"
