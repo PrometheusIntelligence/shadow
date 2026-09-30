@@ -217,11 +217,8 @@ memories/notes whose durable content it absorbed.
   whole node and surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume
   prune`** — reclaim is gated on `is_anonymous_volume` (exactly 64 ascii-hex) AND
   `dangling=true`.
-- macOS launchd: non-demand spawns are pended indefinitely on a long-uptime gui
-  domain, so a watchdog must be a PERSISTENT loop (`WATCHDOG_LOOP=1`) plus one
-  manual `launchctl kickstart`; after `bootout`, `bootstrap` often fails
-  "Input/output error" — retry then `load -w`. `kickstart -k` does NOT re-read a
-  plist.
+- macOS launchd nodes: watchdog must be a persistent loop, `kickstart -k` does not
+  re-read a plist: recall `macos-launchd-fleet-gotchas`.
 
 ## Isolation backends & capability gating
 
@@ -238,11 +235,8 @@ memories/notes whose durable content it absorbed.
   must NOT gate on `bun_runtime`, and a package manager the manifest selects but
   the node lacks is substituted (npm first) with a loud log. Exit 127/42 of an
   explicit repository command maps to typed `BUILD_TOOLCHAIN_MISSING`/`MISMATCH`.
-- PVM kernels: `pti=off` is REQUIRED or `kvm_pvm` refuses to load and `/dev/kvm`
-  disappears; `make install` RESETS grubby args. **`KVM_CREATE_VM` succeeding does
-  NOT mean microVMs work** — booting one can hard-reset the host
-  (`docs/pvm-upstream-report.md`). `hive-cell-agent` reaches a guest only through
-  a rootfs rebuild.
+- PVM kernels: `pti=off` is REQUIRED and `KVM_CREATE_VM` succeeding does NOT mean a
+  microVM boots (can hard-reset the host): recall `pvm-kernel-hard-facts`.
 - Litebox (third `CellBackend`, Firecracker → Litebox → Mock): a node is Litebox
   only after `hive-cloud --litebox-probe` PASSES on that host with the exact staged
   runner AND `litebox_verified=true` on its inventory line — never the flag alone,
@@ -272,14 +266,9 @@ memories/notes whose durable content it absorbed.
   `reachable` predicates as `place` (never the region widening), bounded by
   `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3), stopping when any node RAN it.
   `node_admins` holds http(s):// URLs only.
-- Isolated BuildExecutor (`build_executor.rs`): `HIVE_BUILDAH_SOCKET` is NOT in PID
-  1's environ — only the tenant process carries it, so recover it by scanning
-  `/proc/<pid>/environ`; `/run/lock` needs its own mode=1777 tmpfs; use
-  `--isolation=chroot`; this image's `curl` rejects `--opt=value`. The builder
-  entry init requires the exact 11-cap set with `no_new_privs==0` and drops tenant
-  caps itself, so blanket `--cap-drop=all` cannot pass; the archive pin is
-  all-or-nothing fail-closed. **Do not flip `build_isolation_protocol`** (main.rs
-  hard-codes `None`).
+- Isolated BuildExecutor (`build_executor.rs`): recover `HIVE_BUILDAH_SOCKET` from
+  the tenant process's `/proc/<pid>/environ`; never flip `build_isolation_protocol`
+  (main.rs hard-codes `None`). Full gotcha list: recall `build-executor-isolation-gotchas`.
 - Checkouts live in the DURABLE root `git::deploy_root()` (`$HIVE_DATA/deploys`);
   prefix scanners must cover BOTH roots and BOTH name forms via
   `git::checkout_prefixes`. ZIP extraction REJECTS symlinks and directory entries.
@@ -342,10 +331,8 @@ memories/notes whose durable content it absorbed.
   `hive_crsql::open` and applies `set_ts`. The SQLite lane is owner-routed, never
   leader-routed: the owner re-checks the bearer and refuses to re-proxy, so an
   unreachable owner is an honest 421.
-- SQLite wire: `integer`/`last_insert_rowid` are STRINGS, `blob` is base64 WITH
-  padding, a non-finite float is a loud error, every pipeline request runs even
-  after one errors, v2 AND v3 are served but never `v3-protobuf`, and the
-  path-form DSN MUST end in `/`.
+- SQLite (Hrana) wire contract is strict (strings for integers, padded base64 blobs,
+  v2+v3 never v3-protobuf, DSN ends in `/`): recall `sqlite-hrana-wire-contract`.
 - `browser_db`: grants ride the admission, server-derived and tenant-pinned (Public
   scope read-only, only with `public_read`); caps bind BOTH sides (`max_bytes`
   64 MiB, `max_value_bytes` 1 MiB) and over-cap is a typed refusal + whole-batch
