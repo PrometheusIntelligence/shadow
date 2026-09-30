@@ -48,9 +48,15 @@ export function GlobeWireframe({ className }: { className?: string }) {
             className="pointer-events-none absolute inset-0 block h-full w-full select-none"
           />
         </picture>
+        {/* SMIL cannot be paused from CSS, so the tracer layer is simply not
+            shown when the visitor prefers reduced motion — the static globe
+            underneath is the whole graphic either way. `motion-reduce:hidden`
+            keeps this in CSS (no JS, still prerendered) rather than gating the
+            markup on a client-side media query, which would put the globe back
+            behind hydration. */}
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 select-none [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
+          className="pointer-events-none absolute inset-0 select-none motion-reduce:hidden [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
           dangerouslySetInnerHTML={{ __html: GLOBE_TRACERS_SVG }}
         />
       </div>
