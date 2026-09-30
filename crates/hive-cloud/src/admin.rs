@@ -7036,21 +7036,25 @@ const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
 const POLLED_READ_PER_PEER_BUDGET: Duration = Duration::from_secs(3);
 
 /// TTL for the dashboard-polled response caches (`/v1/functions`,
-/// `/v1/metrics`) — and REQUIRED to be larger than the time it takes to BUILD
-/// an entry, or the cache can never be hit at all.
+/// `/v1/metrics`) — and REQUIRED to outlast one poll INTERVAL plus one build,
+/// or a poller never sees a warm entry.
 ///
-/// Live-witnessed 2026-09-30: both endpoints cost 3.0028 s on the control-
-/// plane leader (fc-sanjose) — exactly `POLLED_READ_PER_PEER_BUDGET`, i.e. one
-/// unreachable-but-healthy-listed peer burning the whole fan-out budget. With a
-/// 3 s TTL the entry was therefore ALREADY expired the instant it was stored,
-/// so every single poll paid the full fan-out and the cache did nothing. It
-/// looked like it worked because fc-phoenix, whose build costs 0.46 s, really
-/// did hit it (0.0004 s on a repeat call) — a node whose build is slower than
-/// the TTL silently gets no caching whatsoever. Since the dashboard's `/ops/*`
-/// proxy forwards to the leader, the slow node is the one users actually hit.
+/// Live-witnessed 2026-09-30: both endpoints cost 3.0028 s to build on the
+/// control-plane leader (fc-sanjose) — exactly `POLLED_READ_PER_PEER_BUDGET`,
+/// i.e. one unreachable-but-healthy-listed peer burning the whole fan-out
+/// budget. A 3 s TTL is therefore shorter than one poll interval plus one
+/// build: an entry stored at T expired at T+3, while the dashboard's 3-5 s poll
+/// cadence next asks at ~T+3.5 — so every poll missed and rebuilt. (Back-to-
+/// back calls DID hit it — 3.0149 s then 0.0008 s, measured on the old binary —
+/// which is what masked this: it looks cached under `curl` twice and uncached
+/// under a real dashboard.)
 ///
-/// 15 s is >4x the measured worst-case build: metrics are minute-granular, so
-/// that staleness is invisible, and the functions list only changes on a deploy.
+/// The missed polls are not evenly distributed either: because the dashboard's
+/// `/ops/*` proxy forwards to the leader, the slow node is the one users hit.
+///
+/// 15 s is >4x the measured worst-case build, so a poll every 3-5 s hits a
+/// warm entry. Metrics are minute-granular so that staleness is invisible, and
+/// the functions list only changes on a deploy.
 const POLLED_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(15);
 
 /// Fan out `path` (identical for every peer — only the target host varies) to
