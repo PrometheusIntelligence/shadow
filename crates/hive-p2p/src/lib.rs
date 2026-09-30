@@ -988,6 +988,56 @@ pub struct RelayStats {
     pub direct_bytes_rx: u64,
     /// Per-peer, per-phase iroh timeout counters (#H4) — `p2p_timeout{phase,node_id}`.
     pub timeouts: Vec<PeerTimeout>,
+    /// Every live trunk with its QUIC transport state, per path. This is the
+    /// number the byte totals above cannot give: a trunk moving 55-93 KB/s at
+    /// 67 ms RTT has only 3-6 KiB in flight, which no byte counter distinguishes
+    /// from a healthy idle trunk. `cwnd`, `lost_packets` and which path is
+    /// SELECTED (relay or direct) tell apart the three explanations — a relayed
+    /// path, loss-collapsed Cubic, or an app-limited sender pinned near the
+    /// 12 000-byte initial window — without guessing.
+    pub trunks: Vec<TrunkStats>,
+}
+
+/// One live trunk's transport state, surfaced via [`PeerPool::relay_stats`].
+#[derive(Clone, Debug, Default)]
+pub struct TrunkStats {
+    pub endpoint_id: String,
+    pub incarnation: u64,
+    /// Any IP path exists (the trunk has holepunched at least once).
+    pub has_direct: bool,
+    /// The path iroh currently sends application data on is the relay.
+    pub selected_is_relay: bool,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub paths: Vec<TrunkPathStats>,
+}
+
+/// One QUIC path of a trunk, straight from noq's `PathStats`.
+#[derive(Clone, Debug, Default)]
+pub struct TrunkPathStats {
+    pub remote: String,
+    pub selected: bool,
+    pub is_ip: bool,
+    pub is_relay: bool,
+    pub rtt_ms: f64,
+    /// Congestion window in bytes. Compare against RTT x observed rate: a
+    /// window near 12 000 on a busy trunk means the sender never left the
+    /// initial window.
+    pub cwnd: u64,
+    pub congestion_events: u64,
+    pub spurious_congestion_events: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
+    pub udp_tx_datagrams: u64,
+    pub udp_rx_datagrams: u64,
+    pub current_mtu: u16,
+    pub black_holes_detected: u64,
+    pub sent_plpmtud_probes: u64,
+    pub lost_plpmtud_probes: u64,
 }
 
 /// One peer/phase timeout counter, surfaced via [`PeerPool::relay_stats`].
@@ -2885,13 +2935,49 @@ impl PeerPool {
         let mut s = RelayStats::default();
         {
             let state = self.lock_state();
-            for t in state.trunks.values() {
+            for (endpoint_id, t) in state.trunks.iter() {
                 let cs = t.conn.stats();
                 let (tx, rx) = (cs.udp_tx.bytes, cs.udp_rx.bytes);
                 // A connection with ANY direct (IP) path has holepunched — its traffic
                 // goes peer-to-peer. A relay-only connection (no IP path) is costing
                 // relay bandwidth for all its bytes.
-                let has_direct = t.conn.paths().iter().any(|p| p.is_ip());
+                let paths = t.conn.paths();
+                let has_direct = paths.iter().any(|p| p.is_ip());
+                let mut ts = TrunkStats {
+                    endpoint_id: endpoint_id.clone(),
+                    incarnation: t.incarnation,
+                    has_direct,
+                    selected_is_relay: paths.iter().any(|p| p.is_selected() && p.is_relay()),
+                    udp_tx_bytes: tx,
+                    udp_rx_bytes: rx,
+                    lost_packets: cs.lost_packets,
+                    lost_bytes: cs.lost_bytes,
+                    paths: Vec::new(),
+                };
+                for p in paths.iter() {
+                    let ps = p.stats();
+                    ts.paths.push(TrunkPathStats {
+                        remote: format!("{:?}", p.remote_addr()),
+                        selected: p.is_selected(),
+                        is_ip: p.is_ip(),
+                        is_relay: p.is_relay(),
+                        rtt_ms: ps.rtt.as_secs_f64() * 1000.0,
+                        cwnd: ps.cwnd,
+                        congestion_events: ps.congestion_events,
+                        spurious_congestion_events: ps.spurious_congestion_events,
+                        lost_packets: ps.lost_packets,
+                        lost_bytes: ps.lost_bytes,
+                        udp_tx_bytes: ps.udp_tx.bytes,
+                        udp_rx_bytes: ps.udp_rx.bytes,
+                        udp_tx_datagrams: ps.udp_tx.datagrams,
+                        udp_rx_datagrams: ps.udp_rx.datagrams,
+                        current_mtu: ps.current_mtu,
+                        black_holes_detected: ps.black_holes_detected,
+                        sent_plpmtud_probes: ps.sent_plpmtud_probes,
+                        lost_plpmtud_probes: ps.lost_plpmtud_probes,
+                    });
+                }
+                s.trunks.push(ts);
                 if has_direct {
                     s.direct_conns += 1;
                     s.direct_bytes_tx += tx;

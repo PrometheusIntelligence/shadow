@@ -8476,6 +8476,40 @@ async fn relay_stats(
                 "direct_bytes_tx": s.direct_bytes_tx,
                 "direct_bytes_rx": s.direct_bytes_rx,
                 "relayed_bytes_pct": relayed_pct,
+                // Per-trunk QUIC transport state, per path (rtt, cwnd, loss, mtu,
+                // selected relay-vs-direct). Read this DURING a bulk pull: it is the
+                // only surface that separates a relayed path, a loss-collapsed
+                // congestion window, and an app-limited sender.
+                "trunks": s.trunks.iter().map(|t| json!({
+                    "endpoint_id": t.endpoint_id,
+                    "incarnation": t.incarnation,
+                    "has_direct": t.has_direct,
+                    "selected_is_relay": t.selected_is_relay,
+                    "udp_tx_bytes": t.udp_tx_bytes,
+                    "udp_rx_bytes": t.udp_rx_bytes,
+                    "lost_packets": t.lost_packets,
+                    "lost_bytes": t.lost_bytes,
+                    "paths": t.paths.iter().map(|p| json!({
+                        "remote": p.remote,
+                        "selected": p.selected,
+                        "is_ip": p.is_ip,
+                        "is_relay": p.is_relay,
+                        "rtt_ms": p.rtt_ms,
+                        "cwnd": p.cwnd,
+                        "congestion_events": p.congestion_events,
+                        "spurious_congestion_events": p.spurious_congestion_events,
+                        "lost_packets": p.lost_packets,
+                        "lost_bytes": p.lost_bytes,
+                        "udp_tx_bytes": p.udp_tx_bytes,
+                        "udp_rx_bytes": p.udp_rx_bytes,
+                        "udp_tx_datagrams": p.udp_tx_datagrams,
+                        "udp_rx_datagrams": p.udp_rx_datagrams,
+                        "current_mtu": p.current_mtu,
+                        "black_holes_detected": p.black_holes_detected,
+                        "sent_plpmtud_probes": p.sent_plpmtud_probes,
+                        "lost_plpmtud_probes": p.lost_plpmtud_probes,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
                 // Per-peer, per-phase iroh timeout counters (#H4) — p2p_timeout{phase,node_id}.
                 "timeouts": s.timeouts.iter().map(|t| json!({
                     "node_id": t.node_id,
