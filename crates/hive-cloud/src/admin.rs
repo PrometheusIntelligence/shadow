@@ -7008,6 +7008,33 @@ pub(crate) async fn fetch_from_host(
     None
 }
 
+/// `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh) are
+/// DIAL-RESILIENCE budgets — right for one-shot control operations,
+/// structurally wrong for anything on a request path: one registry-healthy
+/// peer whose trunk is cold made `/v1/functions` and `/v1/metrics` take a flat
+/// ~20s per poll (measured live), which the 3-5s dashboard polling then piled
+/// onto until the usage page rendered nothing at all. The fetches run
+/// concurrently, so the whole fan-out costs at most one budget; a peer that
+/// misses it contributes to the next poll instead (the wf_runs PHASE_BUDGET
+/// precedent, applied at the shared chokepoint). Kept for CONTROL callers
+/// (the billing meter's `fleet_function_stats`); polled dashboard reads use
+/// `POLLED_READ_PER_PEER_BUDGET` instead.
+const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
+
+/// Per-peer budget for a POLLED dashboard read (every `fan_out_peers_polled`
+/// caller). Live-measured on the 11-node fleet: a peer's `?local=true` handler
+/// answers in ~0.5 ms locally and the mesh round trip is 100-200 ms, so 3s is
+/// >10x headroom over a healthy peer — while 8s is exactly what turned a
+/// congested trunk into a flat 8.00 s page load (`/v1/functions` and
+/// `/v1/metrics` measured at 8.0028 s / 8.0030 s on fc-sanjose, and hitting
+/// 8.00 s on fc-virginia / fc-virginia-3 on every second poll). The mesh was
+/// NOT idle: every node's own gossip collect phase consumed its full 8000 ms
+/// deadline on 30-46 of 46-54 rounds per 10 min (`gossip rounds (last 10 min)`
+/// in the journal), because the admin fan-out shares the pooled trunks with
+/// gossip and the multi-MB store_sync pulls. A peer that misses this budget is
+/// still merged on the next poll, exactly as it was when it missed 8s.
+const POLLED_READ_PER_PEER_BUDGET: Duration = Duration::from_secs(3);
+
 /// Fan out `path` (identical for every peer — only the target host varies) to
 /// every node in `peers` CONCURRENTLY, returning each reachable peer's parsed
 /// JSON response (unreachable/malformed peers are silently absent — never
@@ -7032,19 +7059,34 @@ async fn fan_out_peers(
     team: &str,
     path: &str,
 ) -> Vec<Value> {
-    // PER-PEER budget, at the one chokepoint every dashboard fan-out funnels
-    // through. `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh)
-    // are DIAL-RESILIENCE budgets — right for one-shot control operations,
-    // structurally wrong for polled reads: one registry-healthy peer whose
-    // trunk is cold made `/v1/functions` and `/v1/metrics` take a flat ~20s
-    // per poll (measured live), which the 3-5s dashboard polling then piled
-    // onto until the usage page rendered nothing at all. The fetches run
-    // concurrently, so the whole fan-out now costs at most one budget; a peer
-    // that misses it contributes to the next poll instead (the wf_runs
-    // PHASE_BUDGET precedent, applied at the shared chokepoint).
-    const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
+    fan_out_peers_bounded(c, peers, team, path, PER_PEER_BUDGET).await
+}
+
+/// `fan_out_peers` for the endpoints the dashboard re-asks every few seconds
+/// (functions, metrics, cron, workflows, webhooks, notifications, ops
+/// overview, service-graph). Identical shape, tighter per-peer budget — see
+/// `POLLED_READ_PER_PEER_BUDGET`. Deliberately NOT used by the billing
+/// meter's `fleet_function_stats`: under-counting metered compute is a
+/// revenue-correctness question, and that loop is not latency-critical, so it
+/// keeps the generous control-operation budget.
+async fn fan_out_peers_polled(
+    c: &Arc<CloudState>,
+    peers: &[String],
+    team: &str,
+    path: &str,
+) -> Vec<Value> {
+    fan_out_peers_bounded(c, peers, team, path, POLLED_READ_PER_PEER_BUDGET).await
+}
+
+async fn fan_out_peers_bounded(
+    c: &Arc<CloudState>,
+    peers: &[String],
+    team: &str,
+    path: &str,
+    budget: Duration,
+) -> Vec<Value> {
     futures::future::join_all(peers.iter().map(|name| async move {
-        tokio::time::timeout(PER_PEER_BUDGET, fetch_from_host(c, name, path, team))
+        tokio::time::timeout(budget, fetch_from_host(c, name, path, team))
             .await
             .ok()
             .flatten()
@@ -8326,15 +8368,31 @@ pub async fn functions(
         .filter(|f| (internal && q.local == Some(true)) || norm(&f.tenant) == t)
         .map(|f| json!(f))
         .collect();
+    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
+    // few seconds — the same belt `metrics_get` already wears. The dashboard
+    // polls this endpoint every 3-5s from several co-mounted components and
+    // from every open tab, and the client-side `PATH_TTL` de-dupes only within
+    // ONE tab, so without this each poll paid a full cross-node fan-out:
+    // measured 8.0028s per call on fc-sanjose and a hit at the full per-peer
+    // budget on fc-virginia / fc-virginia-3 on every second poll. Keyed by
+    // tenant (never across tenants) and only for the top-level call, so the
+    // billing meter's own `local=true` slice is never served from here.
+    let is_top_level = q.local != Some(true);
+    let cache_key = format!("functions:{t}:{}", internal);
+    if is_top_level {
+        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(3)) {
+            return Json(v);
+        }
+    }
     // `c.fluid` is THIS node's in-process runtime, but functions run wherever
     // the placement scheduler put them — so the dashboard, polling through the
     // round-robin, kept landing on a node hosting none of the tenant's
     // functions and rendering an empty Functions page and zero usage. The
     // `local=true` guard is required: `fleet_function_stats` also reads this
     // endpoint on every peer, and without it the fan-out would recurse.
-    if q.local != Some(true) {
+    if is_top_level {
         let peers = all_healthy_peers(&c);
-        for v in fan_out_peers(&c, &peers, &t, "/v1/functions?local=true").await {
+        for v in fan_out_peers_polled(&c, &peers, &t, "/v1/functions?local=true").await {
             if let Some(arr) = v.as_array() {
                 list.extend(arr.iter().cloned());
             }
@@ -8348,7 +8406,11 @@ pub async fn functions(
             ))
         });
     }
-    Json(json!(list))
+    let out = json!(list);
+    if is_top_level {
+        c.resp_cache.set(cache_key, out.clone());
+    }
+    Json(out)
 }
 
 /// Tunnel reuse + #14 byte/backpressure metering for this node's gateway.
@@ -9417,7 +9479,7 @@ pub(crate) async fn cron_list(
     // `?local=true` (the internal fan-out marker) short-circuits the recursion.
     if !q.local.unwrap_or(false) {
         // `seen` already holds this node's own (deduped) job ids from above.
-        for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, "/v1/cron?local=true").await {
+        for v in fan_out_peers_polled(&c, &all_healthy_peers(&c), &t, "/v1/cron?local=true").await {
             if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
                 for j in peer_jobs {
                     if seen.insert(j.id.clone()) {
@@ -10238,7 +10300,7 @@ pub(crate) async fn wf_list(
                 )
             })
             .collect();
-        for v in fan_out_peers(
+        for v in fan_out_peers_polled(
             &c,
             &peer_nodes_for_tenant(&c, &team),
             &team,
@@ -10667,7 +10729,7 @@ pub(crate) async fn wf_run_detail(
         if !q.local.unwrap_or(false) {
             let hosts = host_nodes_for_project(&c, project);
             let path = format!("/v1/workflows/runs/{id}?project={project}&local=true");
-            if let Some(v) = fan_out_peers(&c, &hosts, &team, &path)
+            if let Some(v) = fan_out_peers_polled(&c, &hosts, &team, &path)
                 .await
                 .into_iter()
                 .find(|v| found(v))
@@ -10712,7 +10774,7 @@ pub(crate) async fn wf_run_detail(
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
         let path = format!("/v1/workflows/runs/{id}?local=true");
-        if let Some(v) = fan_out_peers(&c, &peers, &team, &path)
+        if let Some(v) = fan_out_peers_polled(&c, &peers, &team, &path)
             .await
             .into_iter()
             .find(|v| found(v))
@@ -10758,7 +10820,7 @@ pub(crate) async fn wf_summary(
     // lives on one host, so per-project rows don't overlap; sum defensively.
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
-        for v in fan_out_peers(&c, &peers, &team, "/v1/workflows/summary?local=true").await {
+        for v in fan_out_peers_polled(&c, &peers, &team, "/v1/workflows/summary?local=true").await {
             if let Some(arr) = v.as_array() {
                 for r in arr {
                     let proj = r
@@ -10878,7 +10940,7 @@ pub(crate) async fn wf_hooks(
             hooks.iter().filter_map(hook_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
         let path = format!("/v1/workflows/hooks?local=true{rid_q}");
-        for v in fan_out_peers(&c, &peers, &team, &path).await {
+        for v in fan_out_peers_polled(&c, &peers, &team, &path).await {
             if let Some(arr) = v.as_array() {
                 for h in arr {
                     if let Some(k) = hook_key(h) {
@@ -11754,7 +11816,7 @@ async fn project_service_graph(
         .map(|n| n.name)
         .collect();
     let path = format!("/v1/projects/{project}/service-graph");
-    if let Some(v) = fan_out_peers(&c, &peers, &t, &path)
+    if let Some(v) = fan_out_peers_polled(&c, &peers, &t, &path)
         .await
         .into_iter()
         .next()
@@ -11917,7 +11979,7 @@ async fn webhook_deliveries(
     // broken when they had in fact delivered. `local=true` stops the recursion.
     if q.local != Some(true) {
         let peers = all_healthy_peers(&c);
-        for v in fan_out_peers(&c, &peers, "", "/v1/webhooks/deliveries?local=true").await {
+        for v in fan_out_peers_polled(&c, &peers, "", "/v1/webhooks/deliveries?local=true").await {
             if let Some(arr) = v.as_array() {
                 all.extend(arr.iter().cloned());
             }
@@ -13896,7 +13958,7 @@ async fn metrics_get(
         if let Some(p) = project {
             path.push_str(&format!("&project={}", urlencode(p)));
         }
-        for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, &path).await {
+        for v in fan_out_peers_polled(&c, &all_healthy_peers(&c), &t, &path).await {
             merge_peer_metrics(
                 &v,
                 &mut series,
@@ -13999,7 +14061,7 @@ async fn speed_insights_get(
         .map(|d| format!("&device={d}"))
         .unwrap_or_default();
     let path = format!("/v1/speed-insights?local=true&minutes={minutes}{dev_qs}");
-    for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, &path).await {
+    for v in fan_out_peers_polled(&c, &all_healthy_peers(&c), &t, &path).await {
         if let Ok(peer_raw) = serde_json::from_value::<RumRaw>(v) {
             raw.merge(&peer_raw);
         }
@@ -14050,7 +14112,7 @@ async fn admin_overview(
     // node happens to serve the request, understating real fleet traffic by up
     // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
     if !q.map(|Query(q)| q.local.unwrap_or(false)).unwrap_or(false) {
-        for v in fan_out_peers(
+        for v in fan_out_peers_polled(
             &c,
             &all_healthy_peers(&c),
             "",
@@ -14996,7 +15058,7 @@ async fn notifications_list(
     // go unseen. Merge peers by the already-deterministic notification id.
     let mut merged: Vec<Value> = items.iter().map(|n| json!(n)).collect();
     let peers = peer_nodes_for_tenant(&c, &team);
-    for v in fan_out_peers(&c, &peers, &team, "/v1/notifications?local=true").await {
+    for v in fan_out_peers_polled(&c, &peers, &team, "/v1/notifications?local=true").await {
         if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
             merged.extend(arr.iter().cloned());
         }
@@ -15266,17 +15328,59 @@ fn billing_authority_node(c: &Arc<CloudState>) -> Option<String> {
     crate::leadership::job_owner(c, crate::leadership::Job::BillingMeter)
 }
 
+/// Budget for the proxy-to-authority hop on a USER-FACING billing read.
+/// `fetch_from_host`'s own budgets (10 s HTTP admin, then 20 s iroh) are
+/// DIAL-RESILIENCE budgets — right for a one-shot control operation, wrong on
+/// a request path (measured live: a follower's `/v1/billing/ledger` spent
+/// ~20 s inside them). A healthy hop is one mesh round trip (100-200 ms
+/// measured), so 3 s is >10x headroom; a hop that misses it falls through to
+/// this node's own in-process billing state, which is the cheaper correct
+/// answer at that point, not an error. `HIVE_BILLING_PROXY_READ_MS` overrides.
+fn billing_proxy_budget() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("HIVE_BILLING_PROXY_READ_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(3000))
+    })
+}
+
 /// Proxy a billing GET to the authority node when this node isn't it — fixes the
 /// confirmed bug where `/v1/billing` answers diverge by node (live-witnessed: 5
 /// distinct billing states, including a `plan` disagreement, across 8 nodes for
 /// the SAME tenant). Falls back to serving this node's own (possibly stale)
 /// local value if the proxy is unreachable, rather than erroring the page.
+///
+/// Bounded by `billing_proxy_budget()` on every caller: these are user-facing
+/// reads, and the authority's own answer (the terminal hop of this proxy, see
+/// `gossip::dispatch`'s `/v1/billing/*` arms) is itself bounded now — so a hop
+/// that misses the budget means the mesh is sick, and this node's local state
+/// is the right thing to serve rather than the reason to wait longer.
 async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     let authority = billing_authority_node(c)?;
     if authority == c.node_name {
         return None; // we ARE authoritative; caller serves its own local read
     }
-    fetch_from_host(c, &authority, path, team).await
+    match tokio::time::timeout(
+        billing_proxy_budget(),
+        fetch_from_host(c, &authority, path, team),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(
+                path,
+                budget_ms = billing_proxy_budget().as_millis() as u64,
+                authority = %authority,
+                "billing: proxy-to-authority missed its budget; serving this node's local billing state"
+            );
+            None
+        }
+    }
 }
 
 pub(crate) async fn billing_get(
@@ -15318,38 +15422,35 @@ pub(crate) async fn billing_get(
 }
 
 /// Invoices for the tenant (finalized periods + current draft, newest first).
-/// Prefers the LOCAL fleet-replicated relational mirror (fastest — no network
-/// hop, and correct even if the billing leader is briefly unreachable),
-/// falling back to the HTTP proxy-to-leader, falling back to this node's own
-/// (possibly stale) local BillingStore.
+///
+/// Read order, deliberately:
+///   1. the LOCAL fleet-replicated relational mirror, bounded by
+///      `relational::billing_read_budget()` — no network hop, and the only
+///      source of finalized invoice history that exists on EVERY node;
+///   2. the HTTP/mesh proxy to the billing authority, bounded by
+///      `billing_proxy_budget()`;
+///   3. this node's own in-process `BillingStore` (instant, never fails).
+///
+/// (2) before (3) is load-bearing, not a latency preference: `BillingStore`'s
+/// invoices are NOT part of the `store_sync` `billing` snapshot (which carries
+/// accounts + ledger only — see `store_sync::REGISTRY`), so a non-authority
+/// node's local `invoices` map holds finalized invoices for nobody. Serving it
+/// before the authority hop would replace a tenant's real invoice history with
+/// a lone draft for the whole duration of any mirror outage. The authority's
+/// own store DOES hold it (and its mirror read is bounded by the same budget,
+/// so the hop terminates there instead of hanging), which is what makes (2)
+/// both more correct than (3) and now fast.
+///
+/// Worst case is therefore bounded: budget + budget + instant, instead of the
+/// live `SQL_OP_TIMEOUT` (10 s) plus an unbounded proxy hop.
 pub(crate) async fn billing_invoices(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some((_, _, Some(invoices_json))) = crate::relational::billing_snapshot(&t).await {
-        if let Ok(Value::Array(mut arr)) = serde_json::from_str::<Value>(&invoices_json) {
-            // The mirror only ever holds FINALIZED invoices (drafts are never
-            // persisted — see `relational::upsert_billing`'s doc comment).
-            // Append the current in-progress period's draft here so this
-            // fast local-mirror path matches the fallback below
-            // (`BillingStore::invoices` always includes the draft), then
-            // re-sort newest-first the same way `invoices()` does.
-            arr.push(json!(c.billing.current_invoice(&t)));
-            arr.sort_by(|a, b| {
-                let pa = a
-                    .get("period_start_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let pb = b
-                    .get("period_start_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                pb.cmp(&pa)
-            });
-            return Json(Value::Array(arr));
-        }
+    if let Some(v) = billing_invoices_from_mirror(&c, &t).await {
+        return Json(v);
     }
     if let Some(v) = proxy_billing_read(&c, "/v1/billing/invoices", &t).await {
         return Json(v);
@@ -15357,13 +15458,58 @@ pub(crate) async fn billing_invoices(
     Json(json!(c.billing.invoices(&t)))
 }
 
+/// The mirror half of `billing_invoices`, or `None` when the mirror cannot
+/// answer for this tenant (not mirrored here, or the read missed its budget) —
+/// the caller falls through to the authority, never to a fabricated empty list.
+///
+/// Equivalence with `BillingStore::invoices` (the last-resort answer in
+/// `billing_invoices`): that method returns the stored FINALIZED invoices plus
+/// `current_invoice` (the in-progress period's draft), sorted newest-first by
+/// `period_start_ms`. The mirror only ever holds finalized invoices (drafts are
+/// never persisted — see `relational::upsert_billing`'s doc comment), so the
+/// draft is appended here and the array re-sorted on the same key. No
+/// double-count is possible: `billing::build_invoice` mints a fresh random id
+/// for every draft, so the appended one can never be an invoice the mirror
+/// already holds.
+async fn billing_invoices_from_mirror(c: &Arc<CloudState>, t: &str) -> Option<Value> {
+    let invoices_json = match crate::relational::billing_snapshot(t).await {
+        crate::relational::BillingSnapshot::Mirrored {
+            invoices: Some(j), ..
+        } => j,
+        _ => return None,
+    };
+    let Ok(Value::Array(mut arr)) = serde_json::from_str::<Value>(&invoices_json) else {
+        return None;
+    };
+    arr.push(json!(c.billing.current_invoice(t)));
+    arr.sort_by(|a, b| {
+        let pa = a
+            .get("period_start_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let pb = b
+            .get("period_start_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        pb.cmp(&pa)
+    });
+    Some(Value::Array(arr))
+}
+
+/// Ledger entries for the tenant (newest first) — same bounded read order as
+/// `billing_invoices` (mirror, then authority, then this node's store); see
+/// that function's doc for why the authority hop precedes the local store.
 pub(crate) async fn billing_ledger(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some((_, Some(ledger_json), _)) = crate::relational::billing_snapshot(&t).await {
+    if let crate::relational::BillingSnapshot::Mirrored {
+        ledger: Some(ledger_json),
+        ..
+    } = crate::relational::billing_snapshot(&t).await
+    {
         if let Ok(v) = serde_json::from_str::<Value>(&ledger_json) {
             return Json(v);
         }

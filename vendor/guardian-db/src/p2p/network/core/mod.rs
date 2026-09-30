@@ -2839,15 +2839,47 @@ impl IrohBackend {
         peers: &[NodeId],
         timeout: Duration,
     ) -> Option<String> {
+        self.request_ticket_from_peers_responding(address, peers, timeout)
+            .await
+            .0
+    }
+
+    /// Same request fan-out as [`request_ticket_from_peers`], but also returns
+    /// the peers that ANSWERED at all — either with a ticket (`Ok(Some(_))`)
+    /// or with a "denied or lacked it" (`Ok(None)`) — as opposed to peers whose
+    /// request errored outright.
+    ///
+    /// The responder set is load-bearing, not diagnostic: the shared-ticket
+    /// election below must decide WHO CREATES the namespace by comparing node
+    /// ids, and an id comparison is only meaningful over peers this node can
+    /// actually reach. Computing it over the optimistic candidate list let a
+    /// single listed-but-unreachable lower-id peer veto namespace creation on
+    /// every node at once — the whole fleet waited for a creator that did not
+    /// exist, every node then hit the election timeout, timed out refusing
+    /// local creation, and no node ever opened the namespace (live-witnessed
+    /// fleet-wide 2026-09-30: `Shared-ticket election for 'hive-state' timed
+    /// out; refusing local namespace creation` on every node, indefinitely).
+    async fn request_ticket_from_peers_responding(
+        &self,
+        address: &str,
+        peers: &[NodeId],
+        timeout: Duration,
+    ) -> (Option<String>, Vec<NodeId>) {
         use futures::{StreamExt, stream};
 
         const MAX_PARALLEL_TICKET_REQUESTS: usize = 8;
 
         if peers.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
-        let endpoint_arc = self.get_endpoint().await.ok()?;
-        let endpoint = endpoint_arc.read().await.as_ref()?.clone();
+        let endpoint_arc = match self.get_endpoint().await {
+            Ok(endpoint) => endpoint,
+            Err(_) => return (None, Vec::new()),
+        };
+        let endpoint = match endpoint_arc.read().await.as_ref() {
+            Some(endpoint) => endpoint.clone(),
+            None => return (None, Vec::new()),
+        };
         let mut attempts = stream::iter(peers.iter().copied().map(|peer| {
             let endpoint = endpoint.clone();
             let address = address.to_string();
@@ -2861,6 +2893,7 @@ impl IrohBackend {
         }))
         .buffer_unordered(MAX_PARALLEL_TICKET_REQUESTS);
 
+        let mut responded = Vec::with_capacity(peers.len());
         while let Some((peer, result)) = attempts.next().await {
             match result {
                 Ok(Some(ticket)) => {
@@ -2870,17 +2903,23 @@ impl IrohBackend {
                     }
                     self.peer_registry.mark_authenticated(peer).await;
                     info!(peer = %peer.fmt_short(), address, "DocTicket obtained from admitted peer");
-                    return Some(ticket);
+                    responded.push(peer);
+                    return (Some(ticket), responded);
                 }
                 Ok(None) => {
+                    // An explicit "I don't have it" is a real answer: this peer
+                    // is reachable, so it counts toward the creator election.
+                    responded.push(peer);
                     debug!(peer = %peer.fmt_short(), address, "Peer denied or lacked the requested ticket");
                 }
                 Err(error) => {
+                    // Not a responder: an unreachable peer must not be allowed
+                    // to outrank this node in the election.
                     debug!(peer = %peer.fmt_short(), address, %error, "Ticket request failed");
                 }
             }
         }
-        None
+        (None, responded)
     }
 
     pub async fn request_ticket_from_known_peers(&self, address: &str) -> Option<String> {
@@ -2907,30 +2946,67 @@ impl IrohBackend {
                 store_key,
                 known_peer_count, "resolve_shared_ticket: stable candidate snapshot"
             );
-            if let Some(ticket) = self
-                .request_ticket_from_peers(store_key, &candidate_peers, attempt_timeout)
-                .await
-            {
+            let (ticket, responded) = self
+                .request_ticket_from_peers_responding(store_key, &candidate_peers, attempt_timeout)
+                .await;
+            if let Some(ticket) = ticket {
                 return Ok(Some(ticket));
             }
 
             let my_id = self.secret_key().public();
-            let lower_peer_exists = candidate_peers
+            // The election compares node ids, so it is only meaningful over
+            // peers proven REACHABLE this round. A peer that never answered is
+            // not a creator candidate: treating it as one let a single
+            // listed-but-unreachable lower-id peer veto namespace creation on
+            // every node at once, and the fleet deadlocked with no creator.
+            let mut electing_peers = candidate_peers;
+            if !responded
                 .iter()
-                .any(|peer| peer.as_bytes() < my_id.as_bytes());
-            if !lower_peer_exists {
-                debug!(store_key, %my_id, "resolve_shared_ticket: elected creator");
+                .any(|peer| peer.as_bytes() < my_id.as_bytes())
+            {
+                info!(
+                    store_key,
+                    %my_id,
+                    responders = responded.len(),
+                    known_peer_count,
+                    "resolve_shared_ticket: elected creator (no reachable peer outranks this node)"
+                );
                 return Ok(None);
             }
 
-            debug!(store_key, %my_id, "resolve_shared_ticket: waiting for elected creator");
+            info!(
+                store_key,
+                %my_id,
+                responders = responded.len(),
+                "resolve_shared_ticket: waiting for an outranking reachable peer to create"
+            );
             loop {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                if let Some(ticket) = self
-                    .request_ticket_from_peers(store_key, &candidate_peers, attempt_timeout)
-                    .await
-                {
+                let (ticket, responded) = self
+                    .request_ticket_from_peers_responding(store_key, &electing_peers, attempt_timeout)
+                    .await;
+                if let Some(ticket) = ticket {
                     return Ok(Some(ticket));
+                }
+                if !responded
+                    .iter()
+                    .any(|peer| peer.as_bytes() < my_id.as_bytes())
+                {
+                    // The peer that used to outrank us stopped answering. It
+                    // may have created the namespace before going quiet, but it
+                    // cannot hand the ticket over any more, so waiting for it
+                    // is waiting for something that will never arrive.
+                    info!(
+                        store_key,
+                        %my_id,
+                        "resolve_shared_ticket: elected creator after the outranking peer(s) stopped answering"
+                    );
+                    return Ok(None);
+                }
+                // Narrow the next round to peers that still answer, so one
+                // silent entry cannot keep the round pinned to a dead peer.
+                if !responded.is_empty() {
+                    electing_peers = responded;
                 }
             }
         };

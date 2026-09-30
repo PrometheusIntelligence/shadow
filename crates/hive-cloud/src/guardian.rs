@@ -317,6 +317,17 @@ async fn handle() -> anyhow::Result<&'static Handle> {
                 );
             } else {
                 INIT_WEDGED.store(true, Ordering::Relaxed);
+                // Name the real cause. Leaving `WEDGE_REASON` unset made every
+                // caller report the default text — "redb lock held by a leaked
+                // prior init attempt; restart hive-cloud to recover" — which
+                // both misattributed the failure (the trigger is whatever made
+                // the FIRST attempt fail, typically the shared-ticket election
+                // timing out) and gave an operator a remedy that cannot work.
+                if let Ok(mut slot) = WEDGE_REASON.lock() {
+                    *slot = Some(format!(
+                        "redb still open after {attempts} init attempts; the first attempt's failure is the real cause (see the preceding 'guardian init' / 'GuardianDB init failed' lines)"
+                    ));
+                }
                 tracing::error!(
                     attempts,
                     "guardian init hit redb 'Database already open' after repeated attempts — a leaked prior attempt in THIS process holds the lock; latching wedged state (no further in-process retries; restart hive-cloud to recover)"
@@ -420,6 +431,16 @@ async fn init_handle() -> anyhow::Result<Handle> {
     let kv = match Box::pin(db.key_value(KV_NAMESPACE, None)).await {
         Ok(kv) => kv,
         Err(e) => {
+            // `db` owns the RedbKeystore (guardian-db opens a redb database
+            // for it), and `shutdown()` on the client does NOT release it —
+            // so a failed KV open used to leave redb open in this process.
+            // The next init attempt then failed `IrohClient::new` with
+            // "Database already open", `INIT_ATTEMPTS` crossed 1, and
+            // guardian latched itself wedged for the whole process life
+            // (live-witnessed on every node, 2026-09-30: the election
+            // timeout was the real cause; this leak turned a retryable
+            // failure into a permanent one). Close the DB first.
+            let _ = db.close().await;
             let _ = seed_client.shutdown().await;
             return Err(anyhow::anyhow!("guardian kv open: {e}"));
         }

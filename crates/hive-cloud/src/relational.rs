@@ -2909,11 +2909,13 @@ fn rows_to_json_objects(res: &[ExecResult]) -> Vec<serde_json::Value> {
 /// same JSON shapes `BillingAccount`/`LedgerEntry`/`Invoice` serialize to
 /// (field names match exactly), so both existing callers
 /// (`admin::billing_invoices`, `admin::billing_ledger`) keep working
-/// unchanged. The whole function returns `None` only when this tenant has
-/// never been mirrored to the relational layer at all — callers fall back to
-/// the existing HTTP proxy-to-leader (`admin::proxy_billing_read`) in that
-/// case, so a cold/lagging replica never surfaces a wrong answer, only a
-/// slightly slower one.
+/// unchanged.
+///
+/// The whole read is bounded by `billing_read_budget()` and reports
+/// `BillingSnapshot::Unavailable` when it cannot finish inside it — callers
+/// fall back to the HTTP proxy-to-leader (`admin::proxy_billing_read`, itself
+/// now budgeted) and then to the in-process `BillingStore`, so a slow or
+/// wedged DB layer costs a bounded delay instead of stalling the request.
 ///
 /// Mirrored-ness is decided by the presence of a `billing_accounts` row, NOT
 /// by whether the `billing_ledger`/`billing_invoices` queries themselves
@@ -2921,18 +2923,104 @@ fn rows_to_json_objects(res: &[ExecResult]) -> Vec<serde_json::Value> {
 /// in the same transaction as the ledger/invoice rows, so a mirrored tenant
 /// with a genuinely empty ledger or invoice history is a real, common case —
 /// its `ledger_json`/`invoices_json` must come back `Some("[]")`, not `None`,
-/// or callers' `if let Some((_, Some(_), _))` fast-path check falls through
-/// to the (correct but slower) fallback for the common case of an
-/// active-but-empty tenant, silently defeating the local-read optimization.
+/// or callers fall through to the (correct but slower) fallback for the common
+/// case of an active-but-empty tenant, silently defeating the local-read
+/// optimization.
 ///
 /// `invoices_json` reflects ONLY finalized invoices — the current
 /// in-progress period's draft is never persisted here (see
 /// `upsert_billing`'s doc comment) — `admin::billing_invoices` appends
 /// `BillingStore::current_invoice` itself to restore that field for callers.
-pub(crate) async fn billing_snapshot(
-    tenant: &str,
-) -> Option<(Option<String>, Option<String>, Option<String>)> {
-    let db = crate::guardian::sql_db().await.ok()?;
+
+/// Budget for ONE user-facing billing mirror read (`billing_snapshot`).
+///
+/// Deliberately an order of magnitude below `SQL_OP_TIMEOUT` (10 s, sized for
+/// an admin/background statement): this is on a REQUEST path, and the live
+/// failure it exists to bound was a `Session::execute` that hung until the
+/// 10 s bound fired on EVERY node — `/v1/billing/ledger` and
+/// `/v1/billing/invoices` answered in exactly 10.00 s with `[]`, then fell
+/// through to `admin::proxy_billing_read`, whose dial-resilience budget added
+/// ~20 s more. A read that misses this budget is not an outage: the caller
+/// serves the authority's (or its own) in-process billing state instead, so the
+/// worst case is bounded, never an unbounded wait.
+///
+/// `HIVE_BILLING_SQL_READ_MS` overrides the 1500 ms default (measured healthy
+/// mirror: sub-millisecond to a few hundred ms; the default is ~5x headroom).
+fn billing_read_budget() -> std::time::Duration {
+    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("HIVE_BILLING_SQL_READ_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(1500))
+    })
+}
+
+/// Rate-limited (30 s) WARN for a billing mirror read that missed its budget.
+fn warn_billing_read_slow(budget: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = wall_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30_000
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            budget_ms = budget.as_millis() as u64,
+            "relational: billing mirror read missed its budget -- serving the in-process \
+             billing state instead (the guardian namespace may be wedged; see SQL_OP_TIMEOUT)"
+        );
+    }
+}
+
+/// Outcome of `billing_snapshot`. The three cases are NOT interchangeable and
+/// callers must not collapse them: `NotMirrored` is a real absence ("this
+/// tenant has never been mirrored here") while `Unavailable` means "we could
+/// not tell". Collapsing them is what let a wedged guardian answer `[]` for a
+/// tenant with real history — an empty array is a genuine answer for an
+/// active-but-empty tenant and must never be fabricated from a failed read.
+pub(crate) enum BillingSnapshot {
+    /// The tenant IS mirrored here (a `billing_accounts` row exists). Each part
+    /// is `None` when THAT part's read failed or missed the budget, so a
+    /// partial failure degrades only the part it affects.
+    Mirrored {
+        ledger: Option<String>,
+        invoices: Option<String>,
+    },
+    /// No `billing_accounts` row for this tenant on this node.
+    NotMirrored,
+    /// The DB layer is down, or did not answer inside `billing_read_budget()`.
+    Unavailable,
+}
+
+pub(crate) async fn billing_snapshot(tenant: &str) -> BillingSnapshot {
+    let budget = billing_read_budget();
+    match tokio::time::timeout(budget, billing_snapshot_uncapped(tenant)).await {
+        Ok(v) => v,
+        Err(_) => {
+            warn_billing_read_slow(budget);
+            BillingSnapshot::Unavailable
+        }
+    }
+}
+
+async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return BillingSnapshot::Unavailable;
+    };
+    // Never wait for the FIRST index walk here. It is a background job sized to
+    // the namespace (minutes on a multi-GB guardian store), and an unbuilt
+    // index reads an EMPTY catalog — every table "does not exist", i.e. a
+    // guaranteed `NotMirrored` that would send the caller down the slow
+    // proxy-to-authority path for no reason. `session()` would otherwise wait
+    // `SQL_OP_TIMEOUT` for it on this request path.
+    if !index_ready() {
+        return BillingSnapshot::Unavailable;
+    }
     let mut s = session(db).await;
 
     let acc_q = format!(
@@ -2941,28 +3029,32 @@ pub(crate) async fn billing_snapshot(
          FROM billing_accounts WHERE tenant = {}",
         q(tenant)
     );
-    let account = exec(&mut s, &acc_q)
-        .await
-        .ok()
-        .map(|r| rows_to_json_objects(&r))
-        .and_then(|rows| rows.into_iter().next())
-        .map(|v| v.to_string());
-
+    // A FAILED query is not an ABSENT row: returning `NotMirrored` here would
+    // tell the caller "this tenant was never mirrored" when the truth is "we
+    // could not read", and the caller would then serve an authority/empty
+    // answer for a tenant whose mirror rows are intact.
+    let account = match exec(&mut s, &acc_q).await {
+        Ok(r) => rows_to_json_objects(&r)
+            .into_iter()
+            .next()
+            .map(|v| v.to_string()),
+        Err(_) => return BillingSnapshot::Unavailable,
+    };
     // Not mirrored at all — never write a partial/empty answer here, let the
     // caller fall back to the HTTP proxy-to-leader (or in-memory read).
-    account.as_ref()?;
+    if account.is_none() {
+        return BillingSnapshot::NotMirrored;
+    }
 
     let ledger_q = format!(
         "SELECT id, tenant, ts_ms, kind, amount_cents, balance_after_cents, note \
          FROM billing_ledger WHERE tenant = {} ORDER BY ts_ms DESC",
         q(tenant)
     );
-    let ledger_rows = exec(&mut s, &ledger_q)
-        .await
-        .ok()
-        .map(|r| rows_to_json_objects(&r))
-        .unwrap_or_default();
-    let ledger = Some(serde_json::Value::Array(ledger_rows).to_string());
+    let ledger = match exec(&mut s, &ledger_q).await {
+        Ok(r) => Some(serde_json::Value::Array(rows_to_json_objects(&r)).to_string()),
+        Err(_) => None,
+    };
 
     let inv_q = format!(
         "SELECT id, number, plan, period_start_ms, period_end_ms, subtotal_cents, total_cents, status, created_ms, \
@@ -2970,11 +3062,13 @@ pub(crate) async fn billing_snapshot(
          FROM billing_invoices WHERE tenant = {} ORDER BY period_start_ms DESC",
         q(tenant)
     );
-    let invoice_rows = exec(&mut s, &inv_q)
-        .await
-        .ok()
-        .map(|r| rows_to_json_objects(&r))
-        .unwrap_or_default();
+    let invoice_rows = match exec(&mut s, &inv_q).await {
+        Ok(r) => rows_to_json_objects(&r),
+        Err(_) => return BillingSnapshot::Mirrored {
+            ledger,
+            invoices: None,
+        },
+    };
     let mut invoices_out = Vec::with_capacity(invoice_rows.len());
     for mut inv in invoice_rows {
         let id = inv
@@ -2986,21 +3080,28 @@ pub(crate) async fn billing_snapshot(
             "SELECT description, amount_cents FROM billing_invoice_lines WHERE invoice_id = {} ORDER BY id",
             q(&id)
         );
-        let lines = exec(&mut s, &lines_q)
-            .await
-            .ok()
-            .map(|r| rows_to_json_objects(&r))
-            .unwrap_or_default();
-        if let Some(obj) = inv.as_object_mut() {
-            obj.insert(
-                "tenant".into(),
-                serde_json::Value::String(tenant.to_string()),
-            );
-            obj.insert("lines".into(), serde_json::Value::Array(lines));
+        match exec(&mut s, &lines_q).await {
+            Ok(r) => {
+                let lines = rows_to_json_objects(&r);
+                if let Some(obj) = inv.as_object_mut() {
+                    obj.insert(
+                        "tenant".into(),
+                        serde_json::Value::String(tenant.to_string()),
+                    );
+                    obj.insert("lines".into(), serde_json::Value::Array(lines));
+                }
+            }
+            // An invoice whose line items could not be read must not be served
+            // as one with zero lines — that under-reports what the tenant owes.
+            Err(_) => return BillingSnapshot::Mirrored {
+                ledger,
+                invoices: None,
+            },
         }
         invoices_out.push(inv);
     }
-    let invoices = Some(serde_json::Value::Array(invoices_out).to_string());
-
-    Some((account, ledger, invoices))
+    BillingSnapshot::Mirrored {
+        ledger,
+        invoices: Some(serde_json::Value::Array(invoices_out).to_string()),
+    }
 }
