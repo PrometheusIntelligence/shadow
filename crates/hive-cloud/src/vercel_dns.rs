@@ -1286,6 +1286,15 @@ struct ReconcileGuards {
 /// backlog (98 on 2026-10-01) drains within minutes either way.
 const STALE_LABEL_SWEEP_PER_PASS: usize = 20;
 
+/// Dead-host pins removed from the apps zone per pass. A specific record BEATS
+/// the wildcard, so a production label left pointing at a host that no longer
+/// exists resolves ONLY to a dead IP and that project is dark until this runs.
+/// Measured 2026-10-01: 125 A records in shadw.app pointed at terminated hosts
+/// (sj3, sj4, gpusj1-3, bkk, saopaulo...). Their owner is gone, so the names
+/// were unmanaged and the diff never touched them -- the same class as the
+/// record that left `sms` pointing at a foreign IP forever.
+const DEAD_PIN_SWEEP_PER_PASS: usize = 40;
+
 /// How long one pass's incident observation stays valid: three passes at the
 /// backoff-extended ceiling (5 min). Every incident this module opens is
 /// re-asserted on each pass while its condition holds and cleared on the pass
@@ -1466,10 +1475,43 @@ async fn reconcile_zone<A: DnsApi>(
     if !sweep.is_empty() {
         tracing::info!(%domain, count = sweep.len(), "DNS reconciler: sweeping stale per-deployment labels (dpl-/commit aliases ride the wildcard)");
     }
+    // Dead-host pins: any A/AAAA whose value is NOT a value we currently desire
+    // (and not an env relay/discovery address) belongs to a host that is gone.
+    // Managing the NAME with nothing desired makes the diff delete the pin, so
+    // the name resolves through the wildcard again instead of a dead IP.
+    let dead_pins: Vec<String> = if domain.eq_ignore_ascii_case(cloud.apps_domain.trim().trim_matches('.')) {
+        let mut allowed: std::collections::HashSet<String> = desired
+            .iter()
+            .filter(|r| r.rtype == "A" || r.rtype == "AAAA")
+            .map(|r| r.value.clone())
+            .collect();
+        for ip in env_ips("HIVE_RELAY_IPS")
+            .iter()
+            .chain(env_ips("HIVE_DISCOVERY_IPS").iter())
+        {
+            allowed.insert(ip.clone());
+        }
+        let mut names: Vec<String> = current
+            .iter()
+            .filter(|r| (r.rtype == "A" || r.rtype == "AAAA") && !allowed.contains(&r.value))
+            .map(|r| r.name.clone())
+            .filter(|n| !managed_names.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names.truncate(DEAD_PIN_SWEEP_PER_PASS);
+        names
+    } else {
+        Vec::new()
+    };
+    if !dead_pins.is_empty() {
+        tracing::info!(%domain, count = dead_pins.len(), "DNS reconciler: sweeping pins to hosts that no longer exist (a specific record beats the wildcard, so these names were dark)");
+    }
     let managed_all: Vec<&str> = managed_names
         .iter()
         .copied()
         .chain(sweep.iter().map(String::as_str))
+        .chain(dead_pins.iter().map(String::as_str))
         .collect();
     // NEVER publish an empty set: losing every record would blackhole the domain
     // harder than stale-but-healthy-yesterday IPs. Keep last-known-good + incident.
