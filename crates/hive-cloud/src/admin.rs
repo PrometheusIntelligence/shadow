@@ -56,6 +56,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/mesh/establish", get(mesh_establish))
+        // Runtime stall counters (node-local, operator-only): see runtime_watch.
+        .route("/v1/admin/runtime", get(admin_runtime))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -8118,6 +8120,15 @@ async fn mesh_establish(
     Ok(Json(json!(hive_p2p::establish_stats(
         crate::meshwatch::establish_wedge_secs()
     ))))
+}
+
+/// This node's tokio-runtime stall counters (`runtime_watch`). Node-local by
+/// nature -- every node reports its own runtime.
+async fn admin_runtime(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(crate::runtime_watch::stats()))
 }
 
 /// THIS node's supervised background loops: restart counts + heartbeat age.

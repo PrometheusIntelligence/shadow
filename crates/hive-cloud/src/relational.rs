@@ -701,7 +701,9 @@ fn spawn_index_refresher(db: SqlDb) {
     if INDEX_REFRESHER_SPAWNED.swap(true, Ordering::AcqRel) {
         return;
     }
-    tokio::spawn(async move {
+    // Bulkhead runtime: a walk over a multi-GB namespace is exactly the kind
+    // of CPU-bound async work that must never occupy a serving worker.
+    crate::bulkhead::spawn(async move {
         let bound = index_build_timeout();
         let interval = index_refresh_interval();
         let mut failures: u32 = 0;
@@ -801,15 +803,37 @@ const SQL_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// timeout and the inner guardian-db error into a single `Result<_, String>`
 /// so every existing call site (`?`, `if let Err`, `.ok()`) keeps working
 /// unchanged.
+/// The ONE chokepoint every SQL execution in this crate goes through.
+///
+/// The guardian SQL engine is CPU-bound by construction: every statement
+/// reloads and re-decodes every row of each table it touches
+/// (`Session::load_table` -> `scan` -> `LoadedTable::build`), so even a
+/// SELECT over `billing_ledger` costs tens of thousands of JSON decodes and
+/// a sort, and a transaction of N statements costs N of those. Run as an
+/// ordinary future on a tokio worker, that work pins the worker and starves
+/// the scheduler -- two workers at 94 % CPU for minutes froze the control-
+/// plane leader's whole runtime on 2026-10-01 (named stacks in
+/// PRD freeze-root-cause-symbolized). `block_in_place` tells the runtime this
+/// worker is about to block, so it hands the worker's queue to a fresh thread
+/// and the drivers, timers and every other task keep running; the engine
+/// then executes on this thread with the session borrowed, exactly as every
+/// caller already holds it. The heavy background callers (the relational
+/// mirror loop, the index walker) additionally run on the `bulkhead` runtime
+/// so they cannot even inflate the serving runtime's blocking pool.
 async fn exec(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     sql: &str,
 ) -> Result<Vec<ExecResult>, String> {
-    match tokio::time::timeout(SQL_OP_TIMEOUT, s.execute(sql)).await {
-        Ok(Ok(res)) => Ok(res),
-        Ok(Err(e)) => Err(format!("{e}")),
-        Err(_) => Err(format!("guardian sql execute timed out after {SQL_OP_TIMEOUT:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
-    }
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(move || {
+        handle.block_on(async {
+            match tokio::time::timeout(SQL_OP_TIMEOUT, s.execute(sql)).await {
+                Ok(Ok(res)) => Ok(res),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => Err(format!("guardian sql execute timed out after {SQL_OP_TIMEOUT:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
+            }
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,28 +1171,56 @@ fn build_account_sql(account: &crate::billing::BillingAccount, now: u64) -> Stri
     )
 }
 
+/// Rows per INSERT statement. The guardian SQL engine loads the WHOLE target
+/// table once PER STATEMENT (`Session::load_table`: every stored row decoded,
+/// the overlay merged into a fresh BTreeMap, the PK index rebuilt), so one
+/// row per statement made a tenant's N-row ledger cost N full table loads --
+/// O(N x M) CPU inside one transaction, which is what burned two tokio
+/// workers for 78 s each on the control-plane leader and froze its runtime
+/// (2026-10-01). N rows per statement cost one load. Chunked so a huge
+/// ledger never becomes one unbounded statement either.
+const ROWS_PER_INSERT: usize = 500;
+
+/// `INSERT INTO ... VALUES (row),(row),... ON CONFLICT ...;` in chunks of
+/// [`ROWS_PER_INSERT`]. `prefix` ends in `VALUES ` and `on_conflict` ends in
+/// `;`. Empty `rows` yields no SQL at all.
+fn multi_row_insert(prefix: &str, rows: &[String], on_conflict: &str) -> String {
+    let mut sql = String::with_capacity(rows.iter().map(|r| r.len() + 1).sum::<usize>() + 256);
+    for chunk in rows.chunks(ROWS_PER_INSERT) {
+        sql.push_str(prefix);
+        sql.push_str(&chunk.join(","));
+        sql.push(' ');
+        sql.push_str(on_conflict);
+    }
+    sql
+}
+
 /// SQL for every ledger row (`ON CONFLICT (id) DO UPDATE` — deterministic
 /// entry ids, so a re-upsert/backfill converges instead of duplicating).
 /// Factored out of `upsert_billing` — see `build_account_sql`.
 fn build_ledger_sql(ledger: &[crate::billing::LedgerEntry]) -> String {
-    let mut sql = String::new();
-    for e in ledger {
-        sql.push_str(&format!(
-            "INSERT INTO billing_ledger (id, tenant, ts_ms, kind, amount_cents, balance_after_cents, note) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}) \
-             ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, ts_ms = excluded.ts_ms, \
-             kind = excluded.kind, amount_cents = excluded.amount_cents, \
-             balance_after_cents = excluded.balance_after_cents, note = excluded.note;",
-            q(&e.id),
-            q(&e.tenant),
-            e.ts_ms,
-            q(&e.kind),
-            e.amount_cents,
-            e.balance_after_cents,
-            q(&e.note),
-        ));
-    }
-    sql
+    let rows: Vec<String> = ledger
+        .iter()
+        .map(|e| {
+            format!(
+                "({}, {}, {}, {}, {}, {}, {})",
+                q(&e.id),
+                q(&e.tenant),
+                e.ts_ms,
+                q(&e.kind),
+                e.amount_cents,
+                e.balance_after_cents,
+                q(&e.note),
+            )
+        })
+        .collect();
+    multi_row_insert(
+        "INSERT INTO billing_ledger (id, tenant, ts_ms, kind, amount_cents, balance_after_cents, note) VALUES ",
+        &rows,
+        "ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, ts_ms = excluded.ts_ms, \
+         kind = excluded.kind, amount_cents = excluded.amount_cents, \
+         balance_after_cents = excluded.balance_after_cents, note = excluded.note;",
+    )
 }
 
 /// Row count of `billing_ledger` for `tenant` in `[period_start_ms,
@@ -1240,7 +1292,8 @@ pub(crate) async fn prune_billing_ledger(
 /// computed on-the-fly, and must never become a stored fact). Factored out
 /// of `upsert_billing` — see `build_account_sql`.
 fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
-    let mut sql = String::new();
+    let mut invoice_rows: Vec<String> = Vec::new();
+    let mut line_rows: Vec<String> = Vec::new();
     for inv in invoices {
         if inv.status != "paid" {
             continue;
@@ -1249,18 +1302,8 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
             Some(cp) => (cp.commitment.clone(), cp.entry_count, cp.pruned),
             None => (String::new(), 0u64, false),
         };
-        sql.push_str(&format!(
-            "INSERT INTO billing_invoices (id, tenant, number, plan, period_start_ms, period_end_ms, \
-             subtotal_cents, total_cents, status, created_ms, \
-             ledger_commitment, ledger_entry_count, ledger_pruned) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
-             ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, number = excluded.number, \
-             plan = excluded.plan, period_start_ms = excluded.period_start_ms, \
-             period_end_ms = excluded.period_end_ms, subtotal_cents = excluded.subtotal_cents, \
-             total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms, \
-             ledger_commitment = excluded.ledger_commitment, \
-             ledger_entry_count = excluded.ledger_entry_count, \
-             ledger_pruned = excluded.ledger_pruned;",
+        invoice_rows.push(format!(
+            "({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             q(&inv.id),
             q(&inv.tenant),
             q(&inv.number),
@@ -1286,11 +1329,8 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
         // up to 999 lines, comfortably beyond any realistic invoice.
         for (idx, line) in inv.lines.iter().enumerate() {
             let line_id = format!("{}-{:03}", inv.id, idx);
-            sql.push_str(&format!(
-                "INSERT INTO billing_invoice_lines (id, invoice_id, description, amount_cents) \
-                 VALUES ({}, {}, {}, {}) \
-                 ON CONFLICT (id) DO UPDATE SET invoice_id = excluded.invoice_id, \
-                 description = excluded.description, amount_cents = excluded.amount_cents;",
+            line_rows.push(format!(
+                "({}, {}, {}, {})",
                 q(&line_id),
                 q(&inv.id),
                 q(&line.description),
@@ -1298,34 +1338,57 @@ fn build_invoices_sql(invoices: &[crate::billing::Invoice]) -> String {
             ));
         }
     }
+    let mut sql = multi_row_insert(
+        "INSERT INTO billing_invoices (id, tenant, number, plan, period_start_ms, period_end_ms, \
+         subtotal_cents, total_cents, status, created_ms, \
+         ledger_commitment, ledger_entry_count, ledger_pruned) VALUES ",
+        &invoice_rows,
+        "ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, number = excluded.number, \
+         plan = excluded.plan, period_start_ms = excluded.period_start_ms, \
+         period_end_ms = excluded.period_end_ms, subtotal_cents = excluded.subtotal_cents, \
+         total_cents = excluded.total_cents, status = excluded.status, created_ms = excluded.created_ms, \
+         ledger_commitment = excluded.ledger_commitment, \
+         ledger_entry_count = excluded.ledger_entry_count, \
+         ledger_pruned = excluded.ledger_pruned;",
+    );
+    sql.push_str(&multi_row_insert(
+        "INSERT INTO billing_invoice_lines (id, invoice_id, description, amount_cents) VALUES ",
+        &line_rows,
+        "ON CONFLICT (id) DO UPDATE SET invoice_id = excluded.invoice_id, \
+         description = excluded.description, amount_cents = excluded.amount_cents;",
+    ));
     sql
 }
 
 /// SQL for every checkout row (`ON CONFLICT (id) DO UPDATE`). Factored out
 /// of `upsert_billing` — see `build_account_sql`.
 fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
-    let mut sql = String::new();
-    for co in checkouts {
-        sql.push_str(&format!(
-            "INSERT INTO billing_checkouts (id, tenant, kind, plan, amount_cents, sku, target, \
-             stripe_session_id, created_ms) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
-             ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, kind = excluded.kind, \
-             plan = excluded.plan, amount_cents = excluded.amount_cents, sku = excluded.sku, \
-             target = excluded.target, stripe_session_id = excluded.stripe_session_id, \
-             created_ms = excluded.created_ms;",
-            q(&co.id),
-            q(&co.tenant),
-            q(&co.kind),
-            q(&co.plan),
-            co.amount_cents,
-            q(&co.sku),
-            q(&co.target),
-            q(&co.stripe_session_id),
-            co.created_ms,
-        ));
-    }
-    sql
+    let rows: Vec<String> = checkouts
+        .iter()
+        .map(|co| {
+            format!(
+                "({}, {}, {}, {}, {}, {}, {}, {}, {})",
+                q(&co.id),
+                q(&co.tenant),
+                q(&co.kind),
+                q(&co.plan),
+                co.amount_cents,
+                q(&co.sku),
+                q(&co.target),
+                q(&co.stripe_session_id),
+                co.created_ms,
+            )
+        })
+        .collect();
+    multi_row_insert(
+        "INSERT INTO billing_checkouts (id, tenant, kind, plan, amount_cents, sku, target, \
+         stripe_session_id, created_ms) VALUES ",
+        &rows,
+        "ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, kind = excluded.kind, \
+         plan = excluded.plan, amount_cents = excluded.amount_cents, sku = excluded.sku, \
+         target = excluded.target, stripe_session_id = excluded.stripe_session_id, \
+         created_ms = excluded.created_ms;",
+    )
 }
 
 // ---------------------------------------------------------------------------

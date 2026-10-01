@@ -155,10 +155,9 @@ memories/notes whose durable content it absorbed.
   8s, so a target that has missed it `LEASH_AFTER_ROUNDS` (2) times running is
   waited on only `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (2500) — still dialed every
   round, and one answer inside the round restores the full deadline. A leash
-  PARKS, never cancels (the task keeps running, its result lands a round late),
-  so it can never cut a dial short mid-discovery; leash state is keyed by
-  ENDPOINT id, never target label (`seed:<64hex>` and bare `<64hex>` are one
-  endpoint). A slow sync is LATE, never absent (`round_contributions`); backoff
+  PARKS, never cancels, so it never cuts a dial short mid-discovery; leash
+  state is keyed by ENDPOINT id, never target label. A slow sync is LATE,
+  never absent (`round_contributions`); backoff
   applies only while this node's view is fresh; `health::demote` withdraws only
   after `DEMOTE_STALE_ROUNDS` (2) stale rounds and HOLDS while the loop is stalled.
 - meshwatch: total isolation (600s), cumulative degradation, and
@@ -212,7 +211,7 @@ memories/notes whose durable content it absorbed.
   and ALWAYS on macOS.
 - Graceful stop must finish inside systemd's timeout: a `persist()` arriving after
   `flush_blocking` closed admission is REFUSED, never blocked (a condvar wait there
-  parks a tokio worker and can kill every timer, the shutdown deadline included);
+  parks a tokio worker and every timer with it);
   `HIVE_SHUTDOWN_DEADLINE_SECS` (75) lives on a std thread; `TimeoutStopSec=90s`
   is explicit (TencentOS defaults it to 5s). Any path that removes a container must
   pass `-v` (`container_cli::rm_args`), since podman allocates one lock from a
@@ -220,8 +219,7 @@ memories/notes whose durable content it absorbed.
   whole node and surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume
   prune`** — reclaim is gated on `is_anonymous_volume` (exactly 64 ascii-hex) AND
   `dangling=true`.
-- macOS launchd nodes: watchdog must be a persistent loop, `kickstart -k` does not
-  re-read a plist: recall `macos-launchd-fleet-gotchas`.
+- macOS launchd nodes: recall `macos-launchd-fleet-gotchas`.
 
 ## Isolation backends & capability gating
 
@@ -245,19 +243,25 @@ memories/notes whose durable content it absorbed.
   runner AND `litebox_verified=true` on its inventory line — never the flag alone,
   never on macOS. The guest tree is staged via `--initial-files=<tar>` with
   `tar -h`. Honest posture: seccomp-bpf beats Mock, but guest and enforcement
-  share one address space and JIT syscalls are an unclosed gap. Details:
-  - A guest child must `execve` immediately: `fork()` hands the child pointers
-    into the PARENT's mapping, so pipelines/subshells abort — hence the shell rc's
-    fork-free `command -v` DEBUG trap (`litebox-shellrc.sh`). A sandbox shell
-    STARTS with stderr off the pty (no job-control tty ioctls; stderr on the pty
-    dies `exit_group(277)`) and the pipe is pumped as RAW CHUNKS.
-  - A TUN device has ONE owner: each exec/shell runner takes its own
-    `allocate_link()` and moves the ARMED `LiteboxLinkRollback` into the waiter
-    task — same rule for the guest tar and its alias, opened after spawn.
-  - Every exec drain runs in its own task under a deadline
-    (`HIVE_SANDBOX_RUN_MS` −10s blocking; `timeout_ms` capped by
-    `HIVE_SANDBOX_EXEC_MAX_MS`); `LiteboxBackend::terminate` kills every exec and
-    shell group first. Reaping strips `/proc/<pid>/exe`'s `" (deleted)"` suffix.
+  share one address space and JIT syscalls are an unclosed gap. Guest rules
+  (fork-free execve, one TUN owner, exec drains under a deadline): recall
+  `litebox-runtime-contract`.
+
+## Runtime discipline (serving runtime never stalls)
+
+- **Heavy work never runs on a serving tokio worker.** The guardian SQL engine
+  reloads every row of each table it touches PER STATEMENT, so
+  `relational::exec` (the one chokepoint) runs under `block_in_place`; the
+  mirror loop and index walker live on the `bulkhead` runtime
+  (`bulkhead::spawn`, `HIVE_BULKHEAD_THREADS` 2); billing mirrors send only
+  this tick's ledger rows as chunked multi-row INSERTs (`ROWS_PER_INSERT`
+  500), full re-send every 60 ticks; two workers at 94% CPU there froze the
+  leader 73–763 s. A loop whose cost grows with the data is
+  spawned on the bulkhead and bounded. `runtime_watch` probes the runtime
+  every 1 s from an OS thread and names the CPU-hot threads of any stall >2 s
+  (`/v1/admin/runtime`; `HIVE_RUNTIME_STALL_DUMP=1` adds a gdb stack); release
+  keeps the symbol table (`strip = "debuginfo"`). Keep `MemoryHigh` above the
+  charged page cache (leader 112G/128G): memory.high throttles every thread.
 
 ## Builds & deploys
 

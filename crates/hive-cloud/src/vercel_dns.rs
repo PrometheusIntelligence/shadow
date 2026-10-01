@@ -1363,7 +1363,6 @@ fn alarm_dark_names(
     desired: &[DesiredRecord],
     managed_names: &[&str],
     end_count: &HashMap<&str, usize>,
-    guards: &mut ReconcileGuards,
     cloud: &Arc<CloudState>,
 ) {
     for name in managed_names {
@@ -1541,7 +1540,7 @@ async fn reconcile_zone<A: DnsApi>(
     {
         // Converged — write nothing. The alarm still runs: it clears the
         // edge trigger for names that have recovered.
-        alarm_dark_names(domain, desired, managed_names, &end_count, guards, cloud);
+        alarm_dark_names(domain, desired, managed_names, &end_count, cloud);
         return Ok(current);
     }
     // Creates are PACED and individually fault-tolerant. Previously this was a
@@ -1933,7 +1932,7 @@ async fn reconcile_zone<A: DnsApi>(
             ),
         });
     }
-    alarm_dark_names(domain, desired, managed_names, &end_count, guards, cloud);
+    alarm_dark_names(domain, desired, managed_names, &end_count, cloud);
     if let Some(e) = failed {
         // Partial progress already landed; surface the failure so the caller
         // backs off and the operator sees it.

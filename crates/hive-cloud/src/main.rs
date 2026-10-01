@@ -58,6 +58,8 @@ mod hrana;
 mod hrana_proto;
 mod identity;
 mod incidents;
+mod runtime_watch;
+mod bulkhead;
 mod inference;
 mod integrations;
 mod integrity_signer;
@@ -547,6 +549,10 @@ async fn async_main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // The runtime stall detector runs on its own OS thread from the first
+    // moment the runtime exists, before any store or loop: a freeze during boot
+    // is attributed too. See `runtime_watch`.
+    runtime_watch::spawn(tokio::runtime::Handle::current());
     // Install the process-level rustls CryptoProvider FIRST (later installs
     // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
     // rustls features, so any rustls user that runs before one of the lazy
@@ -3768,13 +3774,20 @@ fn spawn_cluster_loop(cloud: Arc<CloudState>) {
 /// the same hash and stores no new blob — only a changed snapshot creates one.
 fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_GUARDIAN_SNAPSHOT_SECS", 120));
-    tokio::spawn(async move {
+    // Bulkhead runtime + block_in_place: `capture` clones and serializes the
+    // whole platform state (16-30 MB on the leader: 3-5 s of CPU, audited
+    // 2026-10-01) and `replicate` is synchronous -- neither may occupy a
+    // serving worker. See `bulkhead`.
+    crate::bulkhead::spawn(async move {
         // Small initial delay so first-boot restore/seed settles before the
         // first assert; then steady cadence.
         tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
-            let snap = crate::persist::capture(&cloud);
-            crate::guardian::replicate(&snap);
+            let c = cloud.clone();
+            tokio::task::block_in_place(move || {
+                let snap = crate::persist::capture(&c);
+                crate::guardian::replicate(&snap);
+            });
             tokio::time::sleep(interval).await;
         }
     });
@@ -5279,6 +5292,11 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
         ?interval,
         "relational mirror loop (projects/teams/members/deployments + billing backfill → SQL view)"
     );
+    // On the BULKHEAD runtime (see `bulkhead`): this loop's billing section
+    // ran the guardian SQL engine for minutes at 94 % CPU on the serving
+    // runtime's workers and froze the leader (2026-10-01). Supervision is
+    // kept by running the supervisor itself on the bulkhead.
+    crate::bulkhead::spawn(async move {
     crate::supervise::spawn_supervised("relational-mirror", move || {
         let cloud = cloud.clone();
         async move {
@@ -5290,6 +5308,17 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
             };
             let mut tick = tokio::time::interval(interval);
             let (mut teams_hash, mut deps_hash) = (0u64, 0u64);
+            // Ledger high-water marks: the ledger is append-only per tenant,
+            // so after the first full mirror only entries newer than the
+            // last mirrored `ts_ms` are sent each tick (the engine's cost is
+            // rows SENT x rows STORED, so sending the whole ledger every tick
+            // was the quadratic hog). A full re-send every
+            // `LEDGER_FULL_RESEND_ROUNDS` ticks is the convergence safety net
+            // for anything a prune or a leader change left behind.
+            const LEDGER_FULL_RESEND_ROUNDS: u32 = 60;
+            let mut ledger_marks: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut ledger_round: u32 = 0;
             // Re-assert authoritative project rows every ten leader ticks. A
             // stale node can boot and backfill an old ProjectStore snapshot
             // after the real deletion/recreation write; version-conditional SQL
@@ -5356,10 +5385,21 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                     // invoices, checkouts) tuple set closes that gap: ANY
                     // billing-related change on ANY tenant flips the hash and
                     // triggers a re-sync on the next tick.
+                    ledger_round = (ledger_round + 1) % LEDGER_FULL_RESEND_ROUNDS;
+                    let full_resend = ledger_round == 0;
                     let per_tenant: Vec<_> = accounts
                         .iter()
                         .map(|acc| {
-                            let ledger = cloud.billing.ledger(&acc.tenant);
+                            // Newest first (`BillingStore::ledger`); keep only
+                            // what is newer than the mark unless this is the
+                            // periodic full re-send. `>=` on purpose: entries
+                            // sharing the mark's millisecond are re-sent and
+                            // converge through ON CONFLICT.
+                            let mark = ledger_marks.get(&acc.tenant).copied().unwrap_or(0);
+                            let mut ledger = cloud.billing.ledger(&acc.tenant);
+                            if !full_resend && mark > 0 {
+                                ledger.retain(|e| e.ts_ms >= mark);
+                            }
                             let invoices = cloud.billing.finalized_invoices(&acc.tenant);
                             let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
                             (acc, ledger, invoices, checkouts)
@@ -5399,14 +5439,40 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                         // batch instead of one per tenant — see
                         // `relational::upsert_billing_many`. Per-tenant
                         // transactions are unchanged.
+                        let started = std::time::Instant::now();
+                        let rows: usize = dirty.iter().map(|(_, l, _, _)| l.len()).sum();
                         relational::upsert_billing_many(&dirty).await;
+                        let elapsed_ms = started.elapsed().as_millis() as u64;
+                        if elapsed_ms > 5_000 {
+                            tracing::warn!(
+                                tenants = dirty.len(),
+                                ledger_rows = rows,
+                                elapsed_ms,
+                                full_resend,
+                                "relational: billing mirror pass was slow -- on the bulkhead runtime, so serving is unaffected, but the row volume per tick should be bounded"
+                            );
+                        } else {
+                            tracing::debug!(tenants = dirty.len(), ledger_rows = rows, elapsed_ms, full_resend, "relational: billing mirror pass");
+                        }
                     }
+                    // Advance every tenant's mark to the newest entry it has
+                    // (the snapshot was taken before the write, so nothing
+                    // that arrived meanwhile is skipped: it is newer than the
+                    // mark and goes out next tick).
+                    for (acc, ledger, _, _) in &per_tenant {
+                        if let Some(newest) = ledger.iter().map(|e| e.ts_ms).max() {
+                            let m = ledger_marks.entry(acc.tenant.clone()).or_insert(0);
+                            *m = (*m).max(newest);
+                        }
+                    }
+                    ledger_marks.retain(|t, _| accounts.iter().any(|a| &a.tenant == t));
                     // Replace wholesale so a tenant that disappeared from the
                     // snapshot stops being tracked (no unbounded growth).
                     billing_hashes = next_hashes;
                 }
             }
         }
+    });
     });
 }
 
@@ -5559,12 +5625,17 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                 }
             }
             if !pruned_tenants.is_empty() {
+                // Account/invoice/checkout rows only: the pruned ledger rows
+                // were just DELETEd in SQL and the surviving entries are
+                // already mirrored (and re-asserted by the mirror loop's
+                // periodic full pass). Re-sending a tenant's whole remaining
+                // ledger here cost one full table reload per row.
                 let owned: Vec<_> = pruned_tenants
                     .iter()
                     .map(|tenant| {
                         (
                             cloud.billing.account(tenant),
-                            cloud.billing.ledger(tenant),
+                            Vec::<billing::LedgerEntry>::new(),
                             cloud.billing.finalized_invoices(tenant),
                             cloud.billing.checkouts_for_tenant(tenant),
                         )
@@ -5611,6 +5682,7 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             // per tenant, and each of those re-read the ENTIRE relational
             // index before writing (see `upsert_billing_many`). Metering
             // itself is unchanged and still strictly per tenant.
+            let tick_started_ms = now_ms();
             let mut metered: Vec<String> = Vec::new();
             for (tenant, tot) in totals {
                 charged_any += cloud.billing.meter_usage(&tenant, tot);
@@ -5624,12 +5696,20 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             // (the confirmed 5-way billing-divergence bug). Best-effort:
             // the existing HTTP proxy-to-leader read remains correct and
             // available regardless of this mirror's freshness.
+            // Only the ledger entries THIS tick's metering appended: the
+            // whole ledger (17k rows for the owner tenant) went out here every
+            // 60 s, and the engine reloads the table once per row -- the
+            // quadratic hog behind the 2026-10-01 leader freezes. Older rows
+            // are already mirrored; the mirror loop's periodic full pass is
+            // the convergence net.
             let owned: Vec<_> = metered
                 .iter()
                 .map(|tenant| {
+                    let mut ledger = cloud.billing.ledger(tenant);
+                    ledger.retain(|e| e.ts_ms >= tick_started_ms);
                     (
                         cloud.billing.account(tenant),
-                        cloud.billing.ledger(tenant),
+                        ledger,
                         cloud.billing.finalized_invoices(tenant),
                         cloud.billing.checkouts_for_tenant(tenant),
                     )

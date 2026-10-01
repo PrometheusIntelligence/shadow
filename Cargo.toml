@@ -119,8 +119,11 @@ iroh = { path = "vendor/iroh" }
 [profile.release]
 opt-level = 3
 lto = "thin"
-# Debug symbols stripped from every release binary — real, measured saving on
-# hive-cloud (the largest binary in this workspace, shipped in npm packages):
-# 76.0 -> 62.9 MiB (~17%). Backtraces from a release crash already come from
-# the panic message + RUST_BACKTRACE, not from symbols in the shipped binary.
-strip = true
+# Only DWARF is stripped; the symbol table stays. A fully stripped hive-cloud
+# made the control-plane leader's runtime freezes un-diagnosable: a gdb stack
+# of the CPU-hot worker was 25 lines of `?? ()`, and an unstripped rebuild of
+# the same commit has a different code layout, so its names cannot be mapped
+# back (2026-10-01). The symbol table costs a few MiB (DWARF was the bulk of
+# the 76.0 -> 62.9 MiB saving) and makes `gdb -batch -p <tid> -ex bt` and
+# `/root/stall-watch.sh` captures name the function on the spot.
+strip = "debuginfo"

@@ -749,6 +749,14 @@ pub fn persist(cloud: &Arc<CloudState>) {
 /// caller, which can then fail closed instead of minting a session whose replay
 /// fact exists only in memory.
 pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
+    // Called from request handlers on tokio workers: the capture clones and
+    // serializes the whole state (3-15 s on the leader, audited 2026-10-01)
+    // and the save fsyncs. `block_in_place` hands this worker's queue to a
+    // fresh thread for the duration; outside a runtime it simply runs.
+    tokio::task::block_in_place(|| persist_durable_blocking(cloud))
+}
+
+fn persist_durable_blocking(cloud: &Arc<CloudState>) -> bool {
     if let Some(p) = PERSISTER.get() {
         // Refused after the shutdown barrier: nothing can be made durable
         // ahead of process exit any more, and `false` is exactly the
