@@ -421,11 +421,39 @@ fn lookup(
         if qname == zone || qname.ends_with(&format!(".{zone}")) {
             match qtype {
                 1 | 28 => {
+                    // Affinity FIRST, exactly as the apps zone below: a label
+                    // this fleet can attribute to the node that actually
+                    // hosts it resolves to that node, so the client never pays
+                    // a cross-node forward. This is what lets every preview
+                    // and deployment label live under the fleet's own
+                    // nameservers at any scale -- the answer is computed per
+                    // query from the route table, never published as a
+                    // record anywhere (the Vercel-hosted apps zone needed one
+                    // API-created A record per label: 578 of them on
+                    // 2026-10-01, listed six pages per 30 s pass).
+                    let nodes = cloud.registry.nodes();
+                    if qname != zone {
+                        let label = qname
+                            .strip_suffix(&format!(".{zone}"))
+                            .unwrap_or("")
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        if let Some(owner) = apps_host_owner(cloud, &label) {
+                            if let Some(n) = nodes.iter().find(|n| n.name == owner && n.healthy) {
+                                let rrs = node_addr_rrs(n, qtype);
+                                if !rrs.is_empty() {
+                                    return (rrs, Vec::new(), true, false);
+                                }
+                            }
+                        }
+                    }
                     // Resolve the asker's location HERE (never blocking: an
                     // unknown subnet is queued for background lookup and
                     // reported unknown for now), then let `lb_records` stay pure.
                     let client = cloud.dns_geo.locate(asker.locate_addr());
-                    let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
+                    let (rrs, tailored) = lb_records(&nodes, qtype, client);
                     return (rrs, Vec::new(), true, tailored);
                 }
                 // The zone's OWN apex records. An authoritative server that

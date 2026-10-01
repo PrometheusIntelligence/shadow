@@ -1269,6 +1269,11 @@ struct ReconcileGuards {
     proof_holds: u32,
 }
 
+/// Stale `dpl-`/commit-alias records removed from the apps zone per pass:
+/// deletes count against the same rate-limited API as creates, and the
+/// backlog (98 on 2026-10-01) drains within minutes either way.
+const STALE_LABEL_SWEEP_PER_PASS: usize = 20;
+
 /// How long one pass's incident observation stays valid: three passes at the
 /// backoff-extended ceiling (5 min). Every incident this module opens is
 /// re-asserted on each pass while its condition holds and cleared on the pass
@@ -1413,6 +1418,38 @@ async fn reconcile_zone<A: DnsApi>(
     guards: &mut ReconcileGuards,
 ) -> anyhow::Result<Vec<RecordView>> {
     let current = api.list(domain).await?;
+    // Stale per-deployment labels in the APPS zone. `dpl-<id>` and per-commit
+    // aliases are no longer published (they ride the wildcard, see
+    // `desired_apps_affinity`), but the records created before that change
+    // were never managed again, so they sat in the zone forever -- 98 `dpl-`
+    // A records on 2026-10-01, each pinning a one-off URL to whichever node
+    // hosted it back then. Any such A/AAAA name is treated as managed with
+    // nothing desired, bounded per pass, so the ordinary diff deletes it
+    // (the per-name last-known-good hold below deliberately does not cover
+    // these: nothing is desired for them by design).
+    let sweep: Vec<String> = if domain.eq_ignore_ascii_case(cloud.apps_domain.trim().trim_matches('.')) {
+        let mut names: Vec<String> = current
+            .iter()
+            .filter(|r| r.rtype == "A" || r.rtype == "AAAA")
+            .map(|r| r.name.clone())
+            .filter(|n| !n.contains('.') && (n.starts_with("dpl-") || is_commit_alias(n)))
+            .filter(|n| !managed_names.contains(&n.as_str()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names.truncate(STALE_LABEL_SWEEP_PER_PASS);
+        names
+    } else {
+        Vec::new()
+    };
+    if !sweep.is_empty() {
+        tracing::info!(%domain, count = sweep.len(), "DNS reconciler: sweeping stale per-deployment labels (dpl-/commit aliases ride the wildcard)");
+    }
+    let managed_all: Vec<&str> = managed_names
+        .iter()
+        .copied()
+        .chain(sweep.iter().map(String::as_str))
+        .collect();
     // NEVER publish an empty set: losing every record would blackhole the domain
     // harder than stale-but-healthy-yesterday IPs. Keep last-known-good + incident.
     if !desired.iter().any(|r| r.rtype == "A" || r.rtype == "AAAA") {
@@ -1432,7 +1469,7 @@ async fn reconcile_zone<A: DnsApi>(
         &format!("dns:no-publishable-nodes:{domain}"),
         "Healthy nodes with public addresses are publishable again.",
     );
-    let (creates, deletes) = diff(&current, desired, managed_names);
+    let (creates, deletes) = diff(&current, desired, &managed_all);
     // Per-name last-known-good: a degraded registry view can leave a managed
     // name with ZERO desired addresses while env-sourced names (relay/
     // discovery) keep the overall set non-empty — so the whole-set emptiness
@@ -1522,7 +1559,7 @@ async fn reconcile_zone<A: DnsApi>(
         }
     }
 
-    let plan = plan_writes(&current, desired, managed_names, creates, deletes);
+    let plan = plan_writes(&current, desired, &managed_all, creates, deletes);
     // Projected end-of-pass A/AAAA/NS count per managed name, seeded from the
     // pass-start listing and folded with each CONFIRMED write below — the
     // input to the never-dark alarm at the end of the pass.
