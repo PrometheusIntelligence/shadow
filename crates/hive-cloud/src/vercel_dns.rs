@@ -560,6 +560,18 @@ pub fn desired_api_delegation(
 /// per-branch preview URL and is worth pinning. A project genuinely named
 /// `foo-abc123` would be skipped here, which is harmless — it just keeps the
 /// pre-existing wildcard behaviour rather than gaining the optimisation.
+/// True for any alias minted PER DEPLOYMENT or PER BRANCH rather than per
+/// project: `dpl-<id>`, the per-commit `<project>-<sha>` and the per-branch
+/// `<project>-git-<branch>` URL.
+///
+/// These are the labels that grow with the number of deployments, so none of
+/// them may occupy a record in the third-party apps zone — they resolve through
+/// its wildcard, or (once minted there) through the fleet-served deploy zone
+/// with real affinity. Only a project's own PRODUCTION label is worth a record.
+pub(crate) fn is_preview_label(label: &str) -> bool {
+    label.starts_with("dpl-") || label.contains("-git-") || is_commit_alias(label)
+}
+
 fn is_commit_alias(label: &str) -> bool {
     if label.contains("-git-") {
         return false;
@@ -631,7 +643,7 @@ pub fn desired_apps_affinity(
         // starved the aliases people actually visit. They keep the wildcard's
         // all-nodes behaviour, which is correct: a one-off build URL is not
         // worth a record, and it still resolves.
-        if label.starts_with("dpl-") || is_commit_alias(&label) {
+        if is_preview_label(&label) {
             continue;
         }
         if !seen.insert(label.clone()) {
@@ -1427,12 +1439,21 @@ async fn reconcile_zone<A: DnsApi>(
     // nothing desired, bounded per pass, so the ordinary diff deletes it
     // (the per-name last-known-good hold below deliberately does not cover
     // these: nothing is desired for them by design).
+    // A branch-preview record (`-git-`) is only swept once the deploy zone has a
+    // certificate: until then previews are still minted on the apps domain, so
+    // deleting their records would drop real affinity with no replacement. The
+    // per-deployment `dpl-` / commit labels are swept regardless — they are
+    // already unmanaged and resolve through the wildcard either way.
+    let deploy_ready = crate::dnsserver::deploy_zone()
+        .map(crate::acme::zone_tls_ready)
+        .unwrap_or(false);
     let sweep: Vec<String> = if domain.eq_ignore_ascii_case(cloud.apps_domain.trim().trim_matches('.')) {
         let mut names: Vec<String> = current
             .iter()
             .filter(|r| r.rtype == "A" || r.rtype == "AAAA")
             .map(|r| r.name.clone())
-            .filter(|n| !n.contains('.') && (n.starts_with("dpl-") || is_commit_alias(n)))
+            .filter(|n| !n.contains('.') && is_preview_label(n))
+            .filter(|n| deploy_ready || !n.contains("-git-"))
             .filter(|n| !managed_names.contains(&n.as_str()))
             .collect();
         names.sort();

@@ -1086,7 +1086,26 @@ impl CloudState {
     pub fn deploy_url(&self, alias: &str) -> String {
         if self.ingress != "ngrok" {
             let sub = alias.split('.').next().unwrap_or(alias);
-            format!("https://{}.{}", sub, self.apps_domain)
+            // PREVIEWS go under the fleet-served deploy zone when one is
+            // configured AND its certificate is installed here: Seer answers any
+            // label in that zone with affinity computed per query from the route
+            // table, so a preview costs zero DNS records and zero extra
+            // certificates however many deployments exist. Production keeps the
+            // project's own namespace on the apps domain.
+            //
+            // Gated on the certificate on purpose: a name that resolves but
+            // fails TLS is worse than one that resolves with an extra hop, so
+            // until `*.{deploy_zone}` is installed this keeps the previous
+            // behaviour rather than minting unusable URLs. Old preview links on
+            // the apps domain keep resolving through its wildcard either way.
+            if let Some(dz) = crate::dnsserver::deploy_zone() {
+                if crate::vercel_dns::is_preview_label(sub)
+                    && crate::acme::zone_tls_ready(dz)
+                {
+                    return format!("https://{sub}.{dz}");
+                }
+            }
+            format!("https://{sub}.{}", self.apps_domain)
         } else {
             format!("https://{alias}")
         }

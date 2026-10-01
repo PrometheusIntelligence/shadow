@@ -2142,7 +2142,33 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
             cloud.db_domain.clone(),
         ));
     }
+    // Fleet-served deploy zone (`*.{deploy_zone}` + apex) — the PREVIEW
+    // namespace, and the reason this platform can scale past a third-party
+    // zone: ONE wildcard covers every preview label it will ever mint, so a
+    // preview costs zero DNS records and zero extra certificates. The
+    // alternative (a wildcard per project namespace) needs one certificate per
+    // project and Let's Encrypt caps those at ~50/week per registered domain.
+    // Only when HIVE_DEPLOY_ZONE is set, i.e. the zone really is delegated to
+    // this fleet's nameservers (DNS-01 then answers from the challenge store
+    // via `dnsserver`'s `_acme-challenge` path).
+    if let Some(dz) = crate::dnsserver::deploy_zone() {
+        v.push((
+            "deploy".to_string(),
+            vec![format!("*.{dz}"), dz.to_string()],
+            dz.to_string(),
+        ));
+    }
     v
+}
+
+/// True once a certificate covering `zone` is installed on this node.
+///
+/// `state::deploy_url` gates preview URLs on this: a preview is only minted
+/// under the deploy zone when this node can actually terminate TLS for it, so a
+/// failed or slow issuance degrades to the apps domain instead of handing out
+/// URLs that fail the handshake.
+pub fn zone_tls_ready(zone: &str) -> bool {
+    installed_zones().iter().any(|z| z == zone)
 }
 
 #[cfg(test)]
