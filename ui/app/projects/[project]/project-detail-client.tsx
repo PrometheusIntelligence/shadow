@@ -273,7 +273,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                   </div>
                   <div>
                     <div className="text-muted">Created</div>
-                    <div>{prod ? `${timeAgo(prod.created_at_ms)} ago by ${prod.creator}` : "—"}</div>
+                    <div>{prod ? `${timeAgo(prod.created_at_ms)} by ${prod.creator}` : "—"}</div>
                   </div>
                 </div>
                 <div>
@@ -419,7 +419,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                     <span className="inline-flex items-center gap-1"><Terminal className="h-3.5 w-3.5" /> hive deploy</span>
                   )}
                 </Td>
-                <Td className="px-2 text-secondary hidden sm:table-cell">{timeAgo(d.created_at_ms)} ago</Td>
+                <Td className="px-2 text-secondary hidden sm:table-cell">{timeAgo(d.created_at_ms)}</Td>
                 <Td className="px-2 text-secondary hidden lg:table-cell">{d.creator}</Td>
                 <Td className="px-2">
                   <div onClick={(e) => e.stopPropagation()}>

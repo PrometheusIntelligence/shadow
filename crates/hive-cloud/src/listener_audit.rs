@@ -289,26 +289,27 @@ fn incident_title(node: &str, f: &ForeignListener) -> String {
     }
 }
 
-/// Open ONE Major incident per (node, port, pid) while it stays open — the
-/// leader's incident store is what the ops dashboard and the follower sync
-/// read, so this runs only where `leader` is true; a follower's finding is
-/// its WARN line plus its own `/v1/host/listeners`.
+/// Re-assert ONE Major incident per (node, port, pid) on every pass while the
+/// listener stays open — the leader's incident store is what the ops dashboard
+/// and the follower sync read, so this runs only where `leader` is true; a
+/// follower's finding is its WARN line plus its own `/v1/host/listeners`. The
+/// observation lapses three passes after the listener is gone and the
+/// incident resolves itself. Returns how many incidents this pass OPENED.
 fn raise_incidents(cloud: &Arc<CloudState>, report: &AuditReport) -> usize {
-    use crate::incidents::{IncidentStatus, OpenReq, Severity};
-    let open_titles: HashSet<String> = cloud
-        .incidents
-        .list()
-        .into_iter()
-        .filter(|i| i.status != IncidentStatus::Resolved)
-        .map(|i| i.title)
-        .collect();
+    use crate::incidents::{OpenReq, Severity};
+    let ttl_ms = interval_secs().saturating_mul(3).saturating_mul(1000);
+    let pass_started = hive_core::now_ms();
     let mut opened = 0;
     for f in &report.foreign {
         let title = incident_title(&report.node, f);
-        if open_titles.contains(&title) {
-            continue;
-        }
-        cloud.incidents.open(OpenReq {
+        let inc = cloud.incidents.open(OpenReq {
+            condition: format!(
+                "listener:{}:{}:{}",
+                report.node,
+                f.port,
+                f.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+            ),
+            ttl_ms,
             title,
             severity: Severity::Major,
             affected: vec![report.node.clone()],
@@ -326,7 +327,9 @@ fn raise_incidents(cloud: &Arc<CloudState>, report: &AuditReport) -> usize {
                 f.cgroup,
             ),
         });
-        opened += 1;
+        if inc.created_ms >= pass_started {
+            opened += 1;
+        }
     }
     opened
 }

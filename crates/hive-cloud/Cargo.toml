@@ -56,7 +56,7 @@ pkarr = { version = "3.10", default-features = false, features = ["signed_packet
 tower = { version = "0.5", features = ["util", "limit"] }
 # Connection/request-level DoS bounds on the HTTP listeners: per-request wall
 # timeout, request body size cap, and global in-flight concurrency ceiling.
-tower-http = { version = "0.6", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["timeout", "limit", "compression-gzip", "compression-br"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen"] }
 arc-swap = "1"

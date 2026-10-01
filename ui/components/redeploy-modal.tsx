@@ -163,7 +163,7 @@ export function RedeployModal({
                   <GitCommitHorizontal className="h-3.5 w-3.5 shrink-0" /> <span className="truncate text-xs">{commitMsg}</span>
                 </div>
                 <div className="mt-1 flex items-center gap-1.5 text-sm text-secondary">
-                  <Clock className="h-3.5 w-3.5" /> <span className="text-xs">{timeAgo(deployment.created_at_ms)} ago</span>
+                  <Clock className="h-3.5 w-3.5" /> <span className="text-xs">{timeAgo(deployment.created_at_ms)}</span>
                 </div>
               </div>
             </div>

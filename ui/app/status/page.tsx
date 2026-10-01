@@ -39,7 +39,10 @@ function fmtAgo(ms: number) {
 }
 
 export default function StatusPage() {
-  const { data } = usePoll<Incident[]>("/v1/incidents", 5000);
+  // The public feed: operator-declared incidents only (open + recent
+  // history), served without auth. `/v1/incidents` is operator-gated and
+  // answered this public page 403 for every visitor.
+  const { data } = usePoll<Incident[]>("/v1/status/incidents", 10000);
   const [now, setNow] = useState(0);
   useEffect(() => {
     // Date.now() is client-only and time-varying -- cannot be computed during

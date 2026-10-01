@@ -216,7 +216,7 @@ export function EnvVarsPage({ paramsPromise }: { paramsPromise: Promise<{ projec
                 </div>
               </div>
               <span className="hidden text-xs text-secondary sm:inline">
-                {e.updated_ms ? `Updated ${timeAgo(e.updated_ms)} ago` : "Added"}
+                {e.updated_ms ? `Updated ${timeAgo(e.updated_ms)}` : "Added"}
               </span>
               <span className="text-xs text-secondary underline decoration-dotted underline-offset-2">Edit</span>
               <button

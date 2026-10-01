@@ -290,7 +290,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
           <SettingCard
             title="Continuous Integration"
             desc="Whether a push to this repository actually triggers an auto-deploy — a real GitHub webhook (covers every branch + PR), or an Actions-workflow fallback (push-to-production-branch only) when a webhook can't be installed."
-            footer={settings?.git_ci?.checked_ms ? `Last checked ${timeAgo(settings.git_ci.checked_ms)} ago` : "Never checked — this project's git-import CI install may not have run yet."}
+            footer={settings?.git_ci?.checked_ms ? `Last checked ${timeAgo(settings.git_ci.checked_ms)}` : "Never checked — this project's git-import CI install may not have run yet."}
             footerAction={
               <Button onClick={retryInstall} disabled={retrying}>
                 {retrying ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}

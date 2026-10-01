@@ -1,41 +1,97 @@
 "use client";
 
 import { useState } from "react";
-import { Siren, Plus, X } from "lucide-react";
+import { Siren, Plus, X, Bot } from "lucide-react";
 import { Card, Badge, Button, Input } from "@/components/ui";
-import { opsSend, useOpsPoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
+import { opsGet, opsSend, useOpsPoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { OPEN_LIMIT, OPEN_PATH, RESOLVED_PAGE, resolvedPath } from "@/lib/incident-paths";
 
 const STATUSES: IncidentStatus[] = ["investigating", "identified", "monitoring", "resolved"];
 
-export function IncidentsClient({ initialIncidents }: { initialIncidents: Incident[] | null }) {
-  const { data: incidents, refresh } = useOpsPoll<Incident[]>("/v1/incidents", 4000, true, initialIncidents);
-  const [open, setOpen] = useState(false);
+export function IncidentsClient({
+  initialOpen,
+  initialResolved,
+}: {
+  initialOpen: Incident[] | null;
+  initialResolved: Incident[] | null;
+}) {
+  const { data: open, refresh } = useOpsPoll<Incident[]>(OPEN_PATH, 5000, true, initialOpen);
+  const [resolved, setResolved] = useState<Incident[]>(initialResolved ?? []);
+  const [resolvedDone, setResolvedDone] = useState((initialResolved?.length ?? 0) < RESOLVED_PAGE);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [declare, setDeclare] = useState(false);
+
+  async function loadMore() {
+    setLoadingMore(true);
+    try {
+      const page = await opsGet<Incident[]>(resolvedPath(resolved.length), { fresh: true });
+      setResolved((r) => [...r, ...page.filter((p) => !r.some((x) => x.id === p.id))]);
+      if (page.length < RESOLVED_PAGE) setResolvedDone(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  async function onChanged() {
+    // A posted update may have resolved an open incident: refresh both lists
+    // from the first page so it moves columns instead of vanishing.
+    refresh();
+    const page = await opsGet<Incident[]>(resolvedPath(0), { fresh: true }).catch(() => null);
+    if (page) {
+      setResolved(page);
+      setResolvedDone(page.length < RESOLVED_PAGE);
+    }
+  }
+
+  const openRows = (open ?? []).filter((i) => i.status !== "resolved");
 
   return (
     <div>
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Incidents</h1>
-          <p className="mt-1 text-sm text-secondary">Track and communicate operational incidents across the platform.</p>
+          <p className="mt-1 text-sm text-secondary">
+            Declared incidents are yours to update and close. Automated ones are observed conditions: they resolve themselves once the platform stops observing them.
+          </p>
         </div>
-        <Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Declare Incident</Button>
+        <Button onClick={() => setDeclare(true)}><Plus className="h-4 w-4" /> Declare Incident</Button>
       </div>
 
-      <div className="space-y-4">
-        {(incidents ?? []).map((i) => (
-          <IncidentCard key={i.id} inc={i} onChange={refresh} />
-        ))}
-        {!incidents?.length && (
-          <Card className="flex flex-col items-center gap-2 py-16 text-center">
-            <Siren className="h-8 w-8 text-muted" />
-            <div className="text-sm font-medium">No incidents</div>
-            <p className="text-sm text-secondary">When something breaks, declare an incident to track the response.</p>
-          </Card>
-        )}
-      </div>
+      <section className="mb-8">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-secondary">Open · {openRows.length}{openRows.length >= OPEN_LIMIT ? "+" : ""}</h2>
+        <div className="space-y-4">
+          {openRows.map((i) => (
+            <IncidentCard key={i.id} inc={i} onChange={onChanged} />
+          ))}
+          {!openRows.length && (
+            <Card className="flex flex-col items-center gap-2 py-12 text-center">
+              <Siren className="h-8 w-8 text-muted" />
+              <div className="text-sm font-medium">No open incidents</div>
+              <p className="text-sm text-secondary">When something breaks, declare an incident to track the response.</p>
+            </Card>
+          )}
+        </div>
+      </section>
 
-      {open && <DeclareModal onClose={() => setOpen(false)} onCreated={() => { setOpen(false); refresh(); }} />}
+      <section>
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-secondary">Resolved</h2>
+        <div className="space-y-4">
+          {resolved.map((i) => (
+            <IncidentCard key={i.id} inc={i} onChange={onChanged} />
+          ))}
+          {!resolved.length && (
+            <Card className="py-8 text-center text-sm text-muted">No resolved incidents in the retained history.</Card>
+          )}
+          {!resolvedDone && (
+            <Button variant="outline" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? "Loading…" : `Load ${RESOLVED_PAGE} more`}
+            </Button>
+          )}
+        </div>
+      </section>
+
+      {declare && <DeclareModal onClose={() => setDeclare(false)} onCreated={() => { setDeclare(false); refresh(); }} />}
     </div>
   );
 }
@@ -50,6 +106,12 @@ function statusTone(s: IncidentStatus) {
 function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }) {
   const [status, setStatus] = useState<IncidentStatus>(inc.status);
   const [msg, setMsg] = useState("");
+  const automated = inc.origin === "automated";
+  // The timeline can be long on a condition that flapped for weeks; show the
+  // latest entries and let the operator expand the rest.
+  const [showAll, setShowAll] = useState(false);
+  const timeline = [...inc.updates].reverse();
+  const shown = showAll ? timeline : timeline.slice(0, 5);
 
   async function post() {
     if (!msg.trim()) return;
@@ -61,9 +123,15 @@ function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }
   return (
     <Card>
       <div className="mb-3 flex items-start justify-between gap-3">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Badge tone={sevTone(inc.severity)}>{inc.severity}</Badge>
           <h3 className="text-base font-semibold">{inc.title}</h3>
+          {automated ? (
+            <Badge>
+              <Bot className="mr-1 inline h-3 w-3" />
+              auto
+            </Badge>
+          ) : null}
         </div>
         <Badge tone={statusTone(inc.status)}>{inc.status}</Badge>
       </div>
@@ -72,18 +140,29 @@ function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }
           {inc.affected.map((a) => <Badge key={a}>{a}</Badge>)}
         </div>
       )}
+      {automated && inc.status !== "resolved" && inc.observed_ms ? (
+        <div className="mb-3 text-xs text-muted">
+          Condition last observed {timeAgo(inc.observed_ms)}
+          {inc.expires_ms ? ` · resolves itself if not observed again by ${new Date(inc.expires_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+        </div>
+      ) : null}
 
       <div className="relative space-y-3 border-l border-border pl-4">
-        {[...inc.updates].reverse().map((u, idx) => (
+        {shown.map((u, idx) => (
           <div key={idx} className="relative">
             <span className="absolute -left-[21px] top-1 h-2.5 w-2.5 rounded-full border-2 border-card bg-border-strong" />
             <div className="flex items-center gap-2">
               <span className="text-xs font-medium capitalize">{u.status}</span>
-              <span className="text-xs text-muted">{timeAgo(u.ts_ms)} ago</span>
+              <span className="text-xs text-muted">{timeAgo(u.ts_ms)}</span>
             </div>
             <p className="text-sm text-secondary">{u.message}</p>
           </div>
         ))}
+        {timeline.length > shown.length ? (
+          <button onClick={() => setShowAll(true)} className="text-xs text-secondary hover:text-fg">
+            Show {timeline.length - shown.length} earlier update{timeline.length - shown.length === 1 ? "" : "s"}
+          </button>
+        ) : null}
       </div>
 
       {inc.status !== "resolved" && (

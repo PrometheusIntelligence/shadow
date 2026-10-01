@@ -153,7 +153,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
         <Mini label="Access" value={db.policy.public_read ? "public read" : "team only"} />
         <Mini
           label="Live since"
-          value={db.liveDeployment ? `${timeAgo(db.liveDeployment.created_at_ms)} ago` : "not deployed"}
+          value={db.liveDeployment ? `${timeAgo(db.liveDeployment.created_at_ms)}` : "not deployed"}
           title="The deployment whose manifest carries this project's browser_db block."
         />
       </div>
@@ -218,7 +218,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
             <div className="flex items-center justify-between gap-3">
               <span className="text-secondary">
                 Team (read+write) ·{" "}
-                {rest?.team_token_ms ? `minted ${timeAgo(rest.team_token_ms)} ago` : "not minted"}
+                {rest?.team_token_ms ? `minted ${timeAgo(rest.team_token_ms)}` : "not minted"}
               </span>
               <Button variant="outline" disabled={minting !== null} onClick={() => mint("team")}>
                 {minting === "team" ? "Minting…" : rest?.team_token_ms ? "Rotate" : "Mint"}
@@ -228,7 +228,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
               <div className="flex items-center justify-between gap-3">
                 <span className="text-secondary">
                   Public (read-only) ·{" "}
-                  {rest?.public_token_ms ? `minted ${timeAgo(rest.public_token_ms)} ago` : "not minted"}
+                  {rest?.public_token_ms ? `minted ${timeAgo(rest.public_token_ms)}` : "not minted"}
                 </span>
                 <Button variant="outline" disabled={minting !== null} onClick={() => mint("public")}>
                   {minting === "public" ? "Minting…" : rest?.public_token_ms ? "Rotate" : "Mint"}

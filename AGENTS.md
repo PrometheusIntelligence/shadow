@@ -55,9 +55,12 @@ memories/notes whose durable content it absorbed.
   10 min measured from this node's first observation (never the row's
   `updated_ms`), no retry for the same (project, host, commit) in 6h, and <3
   relocations from this node in the trailing hour.
-- Automated incidents dedup at the primitive: `IncidentStore::open` returns the
-  existing unresolved incident with the same title and `affected` set; only the
-  operator's `POST /v1/incidents` uses `open_new`.
+- **Automated incidents are level-triggered conditions** (`incidents.rs`): the
+  opener calls `IncidentStore::open` EVERY pass with a stable `condition` and a
+  `ttl_ms` of 3 passes (dedup + re-assert), `clear(condition)` on its healthy
+  branch; the leader-only reconciler (`Job::IncidentReconcile`) resolves what
+  lapsed, collapses duplicates and bounds history. Only the operator's
+  `POST /v1/incidents` uses `open_new`. `GET /v1/incidents` is paged + gzip.
 
 ## State: replication, routing, relational mirror
 

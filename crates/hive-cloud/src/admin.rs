@@ -322,7 +322,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/speed-insights", get(speed_insights_get))
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
-        .route("/v1/admin/audit", get(admin_audit))
+        .route(
+            "/v1/admin/audit",
+            get(admin_audit).layer(tower_http::compression::CompressionLayer::new()),
+        )
         .route("/v1/admin/data", get(data_collections))
         .route(
             "/v1/admin/data/:collection",
@@ -356,7 +359,16 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
-        .route("/v1/incidents", get(incidents_list).post(incident_open))
+        // Paged (`?status=open|resolved|all&limit=&offset=`) and compressed:
+        // the unpaged, uncompressed list reached 10.5 MB per poll (2026-10-01).
+        .route(
+            "/v1/incidents",
+            get(incidents_list)
+                .post(incident_open)
+                .layer(tower_http::compression::CompressionLayer::new()),
+        )
+        // Public status board: OPERATOR-declared incidents only (no auth).
+        .route("/v1/status/incidents", get(status_incidents))
         .route("/v1/incidents/:id", axum::routing::delete(incident_delete))
         .route("/v1/incidents/:id/updates", post(incident_update))
         // ---- Low-trust browser serving admissions ----
@@ -14151,6 +14163,17 @@ async fn admin_overview(
     q: Option<Query<OverviewQ>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
+    // Cached like `metrics_get`: the fleet fan-out below costs ~100 ms per
+    // call on the leader and two admin pages poll this every few seconds.
+    let local = q.as_ref().map(|q| q.0.local.unwrap_or(false)).unwrap_or(false);
+    if !local {
+        if let Some(v) = c
+            .resp_cache
+            .get("admin_overview", POLLED_RESPONSE_CACHE_TTL)
+        {
+            return Ok(Json(v));
+        }
+    }
     let (mut reqs, mut blocked) = c.counters();
     let fstats = c.fluid.stats();
     let instances: usize = fstats.iter().map(|f| f.instances).sum();
@@ -14173,7 +14196,7 @@ async fn admin_overview(
     // console's headline request/blocked/error-rate tiles reflect only whichever
     // node happens to serve the request, understating real fleet traffic by up
     // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
-    if !q.map(|Query(q)| q.local.unwrap_or(false)).unwrap_or(false) {
+    if !local {
         for v in fan_out_peers_polled(
             &c,
             &all_healthy_peers(&c),
@@ -14211,7 +14234,7 @@ async fn admin_overview(
         }
         names.len()
     };
-    Ok(Json(json!({
+    let overview = json!({
         "owner": c.owner_email,
         "teams": c.teams.count(),
         "projects": projects_count,
@@ -14237,7 +14260,11 @@ async fn admin_overview(
             "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
             "disk_total_gb": nodes.iter().map(|n| n.disk_total_gb).sum::<u64>(),
         },
-    })))
+    });
+    if !local {
+        c.resp_cache.set("admin_overview".into(), overview.clone());
+    }
+    Ok(Json(overview))
 }
 
 async fn admin_audit(
@@ -14249,12 +14276,44 @@ async fn admin_audit(
     Ok(Json(json!(c.audit.recent(300, None))))
 }
 
+#[derive(Deserialize)]
+struct IncidentsQ {
+    /// `open` | `resolved` | `all` (default: all, the pre-paging shape).
+    status: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Newest first. `x-hive-incidents-total` counts every row the filter admits
+/// and `x-hive-incidents-open` every unresolved row, so a client pages
+/// without a second call.
 async fn incidents_list(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+    Query(q): Query<IncidentsQ>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!(c.incidents.list())))
+    let filter = crate::incidents::Filter::parse(q.status.as_deref());
+    let (rows, total, open) =
+        c.incidents
+            .page(filter, q.limit.unwrap_or(usize::MAX), q.offset.unwrap_or(0));
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&total.to_string()) {
+        headers.insert("x-hive-incidents-total", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&open.to_string()) {
+        headers.insert("x-hive-incidents-open", v);
+    }
+    Ok((headers, Json(json!(rows))).into_response())
+}
+
+/// The public `/status` board's feed: operator-declared incidents only — open
+/// ones plus the 20 most recently resolved. Unauthenticated by design (the
+/// page is public); automated incidents never appear here because their
+/// messages carry node names, pids and command lines.
+async fn status_incidents(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.incidents.public_board()))
 }
 
 /// Leader-forward for mutations of leader→follower REGISTRY-synced stores

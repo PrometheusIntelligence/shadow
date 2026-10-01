@@ -226,7 +226,7 @@ function VerifyCard({ domain, v, onChange }: { domain: string; v: import("@/lib/
         </div>
       )}
       {verified && v.verified_ms > 0 && (
-        <p className="mt-2 text-xs text-muted">Verified {timeAgo(v.verified_ms)} ago · attached to project {v.project}</p>
+        <p className="mt-2 text-xs text-muted">Verified {timeAgo(v.verified_ms)} · attached to project {v.project}</p>
       )}
     </div>
   );

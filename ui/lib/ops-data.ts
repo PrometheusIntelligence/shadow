@@ -1,4 +1,5 @@
 import "server-only";
+import { cookies } from "next/headers";
 
 // Server-side counterpart to lib/api.ts's opsGet -- used by admin ops pages'
 // server components to fetch an initial paint of live operational data before
@@ -19,11 +20,27 @@ const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
  * cache-control layer (next.config.mjs headers()) -- never `"use cache"`.
  */
 export async function fetchOpsServer<T>(path: string): Promise<T> {
+  // Forward the operator's own session cookie. Every ops read is gated by the
+  // backend's `require_operator`, which reads the `hive_jwt` cookie (auth.rs);
+  // without it this server-side fetch was anonymous and answered 403 on every
+  // call (witnessed 2026-10-01: 84 operator-403 lines in 2 h on the leader,
+  // all from this loopback caller), so the "first paint with real numbers"
+  // never actually happened and every admin page showed a skeleton until the
+  // first client poll. The cookie is the same credential the browser sends on
+  // `/ops/*`; proxy.ts has already gated the page on the owner allow-list.
+  const headers: Record<string, string> = {};
+  try {
+    const tok = (await cookies()).get("hive_jwt")?.value;
+    if (tok) headers.cookie = `hive_jwt=${tok}`;
+  } catch {
+    // Outside a request scope (build-time prerender): nothing to forward.
+  }
   // Bounded: an unreachable admin host must fail FAST with an honest error,
   // never hang the server component's render indefinitely — previously a bare
   // fetch with no timeout at all (ui-cloud-proxy-admin-fallback).
   const r = await fetch(`${ADMIN_OPS}${path}`, {
     cache: "no-store",
+    headers,
     signal: AbortSignal.timeout(10_000),
   });
   if (!r.ok) throw new Error(`ops GET ${path} -> ${r.status}`);

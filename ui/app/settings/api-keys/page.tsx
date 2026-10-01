@@ -91,7 +91,7 @@ export default function ApiKeysPage() {
                 <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-subtle text-secondary"><KeyRound className="h-4 w-4" /></span>
                 <div>
                   <div className="flex items-center gap-2 text-sm font-medium">{k.name} <Badge>{k.role}</Badge></div>
-                  <div className="font-mono text-xs text-muted">{k.prefix} · {k.last_used_ms ? `last used ${timeAgo(k.last_used_ms)} ago` : "never used"}</div>
+                  <div className="font-mono text-xs text-muted">{k.prefix} · {k.last_used_ms ? `last used ${timeAgo(k.last_used_ms)}` : "never used"}</div>
                 </div>
               </div>
               <button onClick={() => revoke(k.id)} className="text-muted hover:text-red-500"><Trash2 className="h-4 w-4" /></button>

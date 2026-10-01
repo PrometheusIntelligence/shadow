@@ -405,7 +405,13 @@ async fn relocate_one(
 
     // One incident per (project, dead host) while it stays unresolved, never
     // one per attempt (`open` dedups on title + affected).
+    // Re-asserted by the next attempt for the same (project, host); it may
+    // not come for a whole cooldown, so the observation stays valid that long
+    // plus the grace. A host that returns, or a row that is superseded, stops
+    // the re-assertion and the incident resolves itself.
     let incident = cloud.incidents.open(crate::incidents::OpenReq {
+        condition: format!("relocate:{project}:{}", row.host_node),
+        ttl_ms: RELOCATION_COOLDOWN_MS + RELOCATION_GRACE_MS,
         title: format!("Redeploying '{project}' — its host node went offline"),
         severity: crate::incidents::Severity::Minor,
         affected: vec![row.host_node.clone()],

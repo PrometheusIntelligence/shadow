@@ -114,10 +114,14 @@ pub enum Job {
     BrowserExpiry,
     /// `listener_audit::spawn` — raises foreign-listener incidents.
     ListenerAudit,
+    /// `incidents::spawn_reconciler` — resolves automated incidents whose
+    /// observation lapsed, collapses duplicates and bounds the history: the
+    /// incident store's one writer.
+    IncidentReconcile,
 }
 
 impl Job {
-    pub const ALL: [Job; 13] = [
+    pub const ALL: [Job; 14] = [
         Job::NodeDeathRelocate,
         Job::GitPoll,
         Job::BillingMeter,
@@ -131,6 +135,7 @@ impl Job {
         Job::RelationalLeaderWrites,
         Job::BrowserExpiry,
         Job::ListenerAudit,
+        Job::IncidentReconcile,
     ];
 
     pub fn name(self) -> &'static str {
@@ -148,6 +153,7 @@ impl Job {
             Job::RelationalLeaderWrites => "relational-leader-writes",
             Job::BrowserExpiry => "browser-expiry",
             Job::ListenerAudit => "listener-audit",
+            Job::IncidentReconcile => "incident-reconcile",
         }
     }
 

@@ -34,7 +34,7 @@ export function AdminTeamsClient({ initialTeams }: { initialTeams: Team[] | null
                 <Td><Badge tone="blue">{t.plan}</Badge></Td>
                 <Td>{t.members.length}</Td>
                 <Td className="text-secondary">{owner?.email ?? "—"}</Td>
-                <Td className="text-secondary">{t.created_ms ? `${timeAgo(t.created_ms)} ago` : "—"}</Td>
+                <Td className="text-secondary">{t.created_ms ? `${timeAgo(t.created_ms)}` : "—"}</Td>
               </tr>
             );
           })}

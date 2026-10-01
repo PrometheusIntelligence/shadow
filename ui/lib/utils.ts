@@ -5,6 +5,9 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** A relative timestamp that already ends in "ago" ("5m ago", "just now") —
+ *  callers never append their own "ago" (22 call sites rendered "5m ago ago"
+ *  on 2026-10-01). */
 export function timeAgo(ms: number): string {
   const d = Date.now() - ms;
   if (d < 1000) return "just now";

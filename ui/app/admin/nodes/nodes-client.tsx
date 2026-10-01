@@ -12,8 +12,9 @@ export function AdminNodesClient({
   initialNodes: NodeInfo[] | null;
   initialOverview: AdminOverview | null;
 }) {
-  const { data: nodes } = useOpsPoll<NodeInfo[]>("/v1/nodes", 3000, true, initialNodes);
-  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 4000, true, initialOverview);
+  const { data: nodes } = useOpsPoll<NodeInfo[]>("/v1/nodes", 5000, true, initialNodes);
+  // Matches the backend's 15 s response cache for the overview fan-out.
+  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (
@@ -51,7 +52,7 @@ export function AdminNodesClient({
               <Td><Badge tone="blue">{n.region}</Badge></Td>
               <Td className="font-mono text-xs text-secondary">{n.public_url}</Td>
               <Td>{n.id === ov?.cluster?.leader ? <Badge tone="amber">leader</Badge> : n.is_self ? <Badge tone="green">this node</Badge> : <Badge>peer</Badge>}</Td>
-              <Td className="text-secondary">{timeAgo(n.last_seen_ms)} ago</Td>
+              <Td className="text-secondary">{timeAgo(n.last_seen_ms)}</Td>
             </tr>
           ))}
         </tbody>

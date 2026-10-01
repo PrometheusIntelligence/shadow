@@ -66,7 +66,7 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
             label="Production Branch"
             value={prodBranch ? <span className="font-mono text-xs">{prodBranch}</span> : "—"}
           />
-          <Row label="Last deployed" value={dep ? `${timeAgo(dep.created_at_ms)} ago by ${dep.creator}` : "—"} />
+          <Row label="Last deployed" value={dep ? `${timeAgo(dep.created_at_ms)} by ${dep.creator}` : "—"} />
         </div>
       </SettingCard>
 

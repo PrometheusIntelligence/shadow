@@ -98,7 +98,7 @@ export function SandboxesPage({ paramsPromise }: { paramsPromise: Promise<{ proj
                     ))}
                   </div>
                 </Td>
-                <Td className="text-secondary">{timeAgo(s.created_at)} ago</Td>
+                <Td className="text-secondary">{timeAgo(s.created_at)}</Td>
                 <Td>
                   <RowActions project={project} sandbox={s} onChanged={refresh} />
                 </Td>

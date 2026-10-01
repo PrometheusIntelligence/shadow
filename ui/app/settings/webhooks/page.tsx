@@ -185,7 +185,7 @@ export default function WebhooksPage() {
                 <span className="font-mono text-xs">{d.event}</span>
                 <span className="min-w-0 flex-1 truncate text-xs text-secondary">{d.url}</span>
                 <Badge tone={d.ok ? "green" : "red"}>{d.status || "ERR"}</Badge>
-                <span className="text-xs text-muted">{timeAgo(d.ts_ms)} ago</span>
+                <span className="text-xs text-muted">{timeAgo(d.ts_ms)}</span>
               </div>
             ))}
           </div>

@@ -219,7 +219,7 @@ function NotificationRow({ n, onArchive, archivable }: { n: Notification; onArch
         <div className="text-sm leading-snug text-secondary">{richMessage(n)}</div>
         <div className="mt-1 flex items-center gap-2 text-xs text-muted">
           {!n.read && <span className="h-1.5 w-1.5 rounded-full bg-[#0070f3]" />}
-          {timeAgo(n.ts_ms)} ago
+          {timeAgo(n.ts_ms)}
         </div>
       </div>
       {archivable && (

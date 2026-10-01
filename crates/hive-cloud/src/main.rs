@@ -2069,6 +2069,11 @@ async fn async_main() -> anyhow::Result<()> {
     listener_audit::spawn(cloud.clone(), |c| {
         leadership::may_act(c, leadership::Job::ListenerAudit)
     });
+    // Incident reconciler: automated incidents are level-triggered projections
+    // of observed conditions and resolve themselves when the observation
+    // lapses; the leader (the store's writer) is the only node that changes
+    // the list. See `incidents`.
+    incidents::spawn_reconciler(cloud.clone());
     spawn_deletion_reconcile_loop(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies

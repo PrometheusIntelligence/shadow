@@ -253,7 +253,7 @@ function BillingInner() {
               <span className={`tabular-nums ${l.amount_cents < 0 ? "text-red-500" : "text-emerald-600 dark:text-emerald-400"}`}>
                 {l.amount_cents < 0 ? "" : "+"}{usd(l.amount_cents)}
               </span>
-              <span className="text-muted">{timeAgo(l.ts_ms)} ago</span>
+              <span className="text-muted">{timeAgo(l.ts_ms)}</span>
             </div>
           ))
         )}

@@ -1248,13 +1248,6 @@ struct ReconcileGuards {
     /// deletes outright — a stale-but-answering delegation beats a dark name,
     /// always.
     create_failing_passes: u32,
-    /// Edge trigger for the account-wide create-failure incident.
-    create_incident_open: bool,
-    /// Managed names already alarmed as dark (`"{domain}\0{name}"`) — the edge
-    /// trigger so a sustained outage opens ONE incident per name, not one per
-    /// pass. Cleared once the name has records again, so a LATER outage of
-    /// the same name alarms afresh.
-    dark_alarmed: std::collections::HashSet<String>,
     /// Whether a create has SUCCEEDED during this node's current leadership
     /// tenure. `false` is the UNKNOWN state, and unknown is treated exactly
     /// like an open circuit — for the same reason `api_ns_published: None`
@@ -1274,9 +1267,13 @@ struct ReconcileGuards {
     /// transition, so no create is ever attempted to prove health — becomes
     /// an operator-visible incident instead of a silently parked cutover.
     proof_holds: u32,
-    /// Edge trigger for that incident.
-    proof_incident_open: bool,
 }
+
+/// How long one pass's incident observation stays valid: three passes at the
+/// backoff-extended ceiling (5 min). Every incident this module opens is
+/// re-asserted on each pass while its condition holds and cleared on the pass
+/// that sees it gone; the reconciler resolves it if the passes simply stop.
+const INCIDENT_TTL_MS: u64 = 3 * 5 * 60 * 1000;
 
 /// Delete-first steps skipped for want of create-health proof before the hold
 /// itself is alarmed. At most one skip per zone per pass, so this is roughly
@@ -1308,7 +1305,6 @@ impl ReconcileGuards {
     fn begin_tenure(&mut self) {
         self.create_proven = false;
         self.proof_holds = 0;
-        self.proof_incident_open = false;
     }
 
     /// Fold one zone-pass's create outcomes into the circuit. A pass with no
@@ -1316,10 +1312,8 @@ impl ReconcileGuards {
     fn record_pass(&mut self, attempted: usize, succeeded: usize) {
         if succeeded > 0 {
             self.create_failing_passes = 0;
-            self.create_incident_open = false;
             self.create_proven = true;
             self.proof_holds = 0;
-            self.proof_incident_open = false;
         } else if attempted > 0 {
             self.create_failing_passes = self.create_failing_passes.saturating_add(1);
         }
@@ -1333,11 +1327,12 @@ impl ReconcileGuards {
             return;
         }
         self.proof_holds = self.proof_holds.saturating_add(1);
-        if self.proof_holds < CREATE_PROOF_ALARM_HOLDS || self.proof_incident_open {
+        if self.proof_holds < CREATE_PROOF_ALARM_HOLDS {
             return;
         }
-        self.proof_incident_open = true;
         cloud.incidents.open(crate::incidents::OpenReq {
+            condition: "dns:create-proof-hold".into(),
+            ttl_ms: INCIDENT_TTL_MS,
             title: "DNS delegation transition parked: create health unproven".into(),
             severity: crate::incidents::Severity::Major,
             affected: vec!["dns".into()],
@@ -1375,9 +1370,12 @@ fn alarm_dark_names(
         let wants = desired
             .iter()
             .any(|d| d.name == *name && (d.rtype == "A" || d.rtype == "AAAA" || d.rtype == "NS"));
-        let key = format!("{domain}\u{0}{name}");
+        let key = format!("dns:dark:{name}.{domain}");
         if !wants || end_count.get(*name).copied().unwrap_or(0) > 0 {
-            guards.dark_alarmed.remove(&key);
+            cloud.incidents.clear(
+                &key,
+                "The name publishes records again (or nothing is desired for it any more).",
+            );
             continue;
         }
         tracing::error!(
@@ -1385,21 +1383,21 @@ fn alarm_dark_names(
             name = %name,
             "DNS reconciler: managed name ends the pass with NEITHER addresses NOR delegation published — it is DARK"
         );
-        if guards.dark_alarmed.insert(key) {
-            cloud.incidents.open(crate::incidents::OpenReq {
-                title: format!(
-                    "DNS name dark: {name}.{domain} serves neither addresses nor delegation"
-                ),
-                severity: crate::incidents::Severity::Major,
-                affected: vec!["dns".into()],
-                message: format!(
-                    "The reconcile pass desired records for {name}.{domain} but confirmed none published at its end — \
-                     every create failed (an account-wide create block fails creates while still allowing deletes) or \
-                     a delegation transition was interrupted. The name resolves to nothing. Check the Vercel account's \
-                     create health and this node's reconcile logs."
-                ),
-            });
-        }
+        cloud.incidents.open(crate::incidents::OpenReq {
+            condition: key,
+            ttl_ms: INCIDENT_TTL_MS,
+            title: format!(
+                "DNS name dark: {name}.{domain} serves neither addresses nor delegation"
+            ),
+            severity: crate::incidents::Severity::Major,
+            affected: vec!["dns".into()],
+            message: format!(
+                "The reconcile pass desired records for {name}.{domain} but confirmed none published at its end — \
+                 every create failed (an account-wide create block fails creates while still allowing deletes) or \
+                 a delegation transition was interrupted. The name resolves to nothing. Check the Vercel account's \
+                 create health and this node's reconcile logs."
+            ),
+        });
     }
 }
 
@@ -1422,6 +1420,8 @@ async fn reconcile_zone<A: DnsApi>(
         STATS.empty_set_blocks.fetch_add(1, Ordering::Relaxed);
         tracing::error!(%domain, "DNS reconciler: desired record set is EMPTY — keeping last-known-good records and raising an incident");
         cloud.incidents.open(crate::incidents::OpenReq {
+            condition: format!("dns:no-publishable-nodes:{domain}"),
+            ttl_ms: INCIDENT_TTL_MS,
             title: format!("DNS reconciler: no publishable nodes for {domain}"),
             severity: crate::incidents::Severity::Major,
             affected: vec!["dns".into()],
@@ -1429,6 +1429,10 @@ async fn reconcile_zone<A: DnsApi>(
         });
         return Ok(current);
     }
+    cloud.incidents.clear(
+        &format!("dns:no-publishable-nodes:{domain}"),
+        "Healthy nodes with public addresses are publishable again.",
+    );
     let (creates, deletes) = diff(&current, desired, managed_names);
     // Per-name last-known-good: a degraded registry view can leave a managed
     // name with ZERO desired addresses while env-sourced names (relay/
@@ -1822,6 +1826,8 @@ async fn reconcile_zone<A: DnsApi>(
         } else {
             tracing::error!(%domain, name = %name, failed_records = ?restore_failed, "disengagement rollback INCOMPLETE — {name} has neither addresses nor delegation");
             cloud.incidents.open(crate::incidents::OpenReq {
+                condition: format!("dns:disengage-rollback:{name}.{domain}"),
+                ttl_ms: INCIDENT_TTL_MS,
                 title: format!(
                     "DNS disengagement rollback incomplete: {name}.{domain} is dark"
                 ),
@@ -1899,9 +1905,22 @@ async fn reconcile_zone<A: DnsApi>(
     // Fold this pass's create outcomes into the circuit BEFORE the Err return
     // below: a failing pass must still arm the guard for the next one.
     guards.record_pass(creates_attempted, creates_succeeded);
-    if guards.create_failing_passes >= 2 && !guards.create_incident_open {
-        guards.create_incident_open = true;
+    if guards.create_failing_passes == 0 {
+        cloud.incidents.clear(
+            "dns:creates-failing",
+            "A create succeeded again — the account-wide create block has lifted.",
+        );
+    }
+    if guards.create_proven {
+        cloud.incidents.clear(
+            "dns:create-proof-hold",
+            "A create succeeded under this leadership tenure — delete-first steps resume.",
+        );
+    }
+    if guards.create_failing_passes >= 2 {
         cloud.incidents.open(crate::incidents::OpenReq {
+            condition: "dns:creates-failing".into(),
+            ttl_ms: INCIDENT_TTL_MS,
             title: "Vercel DNS creates failing account-wide".into(),
             severity: crate::incidents::Severity::Major,
             affected: vec!["dns".into()],
@@ -2200,9 +2219,6 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
         // process starts with, so the first-pass Hold is preserved exactly.
         let mut api_ns_published: Option<bool> = None;
         let mut backoff: u64 = 0; // consecutive failures
-                                  // Edge-trigger for the "delegation held" incident (see the call site).
-        let mut geo_hold_active = false;
-        let mut api_hold_active = false;
         // The ownership term this node last took over DNS writing under
         // (`leadership::Verdict::term`). A new term — never a `may_act` edge,
         // which also flips on a quorum or isolation blip inside one tenure —
@@ -2332,14 +2348,6 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             if leader_term != verdict.term {
                 leader_term = verdict.term;
                 guards.begin_tenure();
-                // The two "delegation held" incidents are edge-triggered per
-                // WRITER: carrying a previous tenure's flag across a foreign
-                // tenure would silently suppress the announcement that the
-                // hold is still in force under the new leader. Re-arming costs
-                // at most one incident per handover and always errs toward
-                // telling the operator.
-                geo_hold_active = false;
-                api_hold_active = false;
                 tracing::info!(
                     withheld = memory.publish.withheld.len(),
                     api_ready = memory.api.ready,
@@ -2453,10 +2461,8 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // running on last-known-good NS records that nobody can currently
             // prove — publishing the (0 or 1) proven ones would blackhole it,
             // and staying silent about it would leave an operator believing the
-            // delegation is healthy. Incident on the TRANSITION only: this
-            // condition persists for as long as the proof is missing, and
-            // `incidents::open` does not dedup, so per-pass would bury the
-            // incident list.
+            // delegation is healthy. Re-asserted every pass while held (the
+            // store dedups on the condition) and cleared the pass it lifts.
             if geo_zone_label.is_some() && geo_records.is_empty() && nodes.iter().any(|n| n.dns_ns)
             {
                 STATS.geo_delegation_holds.fetch_add(1, Ordering::Relaxed);
@@ -2465,22 +2471,24 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     unproven = ?unproven,
                     "geo delegation HELD: fewer than 2 nameservers are currently proven reachable — keeping the published NS records rather than deleting them (deleting would blackhole the whole zone)"
                 );
-                if !geo_hold_active {
-                    geo_hold_active = true;
-                    cloud.incidents.open(crate::incidents::OpenReq {
-                        title: "Geo-DNS delegation held: fewer than 2 proven nameservers".into(),
-                        severity: crate::incidents::Severity::Major,
-                        affected: vec!["dns".into()],
-                        message: format!(
-                            "Nameservers declaring dns_ns but currently unproven from peer vantages: {}. \
-                             The existing NS records are being held (not deleted) so the zone keeps resolving. \
-                             See GET /v1/dns/stats for the per-node evidence.",
-                            if unproven.is_empty() { "-".to_string() } else { unproven.join(", ") }
-                        ),
-                    });
-                }
+                cloud.incidents.open(crate::incidents::OpenReq {
+                    condition: "dns:geo-hold".into(),
+                    ttl_ms: INCIDENT_TTL_MS,
+                    title: "Geo-DNS delegation held: fewer than 2 proven nameservers".into(),
+                    severity: crate::incidents::Severity::Major,
+                    affected: vec!["dns".into()],
+                    message: format!(
+                        "Nameservers declaring dns_ns but currently unproven from peer vantages: {}. \
+                         The existing NS records are being held (not deleted) so the zone keeps resolving. \
+                         See GET /v1/dns/stats for the per-node evidence.",
+                        if unproven.is_empty() { "-".to_string() } else { unproven.join(", ") }
+                    ),
+                });
             } else {
-                geo_hold_active = false;
+                cloud.incidents.clear(
+                    "dns:geo-hold",
+                    "At least two nameservers are proven from peer vantages again; the geo delegation is no longer held.",
+                );
             }
             apps.extend(geo_records);
             apps_managed.extend(geo_names);
@@ -2525,11 +2533,10 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             };
             // A HELD api delegation must be loud, same rule as the geo hold:
             // the name is running on last-known-good NS records nobody can
-            // currently prove. Incident on the TRANSITION only
-            // (`incidents::open` does not dedup), and only when a delegation
-            // is actually published — a hold over an UNOBSERVED name (a fresh
-            // leader's first passes) is the safe-direction default, not an
-            // incident.
+            // currently prove. Re-asserted every pass while held and cleared
+            // the pass it lifts, and only when a delegation is actually
+            // published — a hold over an UNOBSERVED name (a fresh leader's
+            // first passes) is the safe-direction default, not an incident.
             if api_hold {
                 STATS.api_delegation_holds.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
@@ -2538,9 +2545,10 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     delegated = ?api_ns_published,
                     "api delegation HELD: fewer than 2 proven api-capable nameservers — the api name is left exactly as published (changing it on a proof dip is how a name goes dark)"
                 );
-                if !api_hold_active && api_ns_published == Some(true) {
-                    api_hold_active = true;
+                if api_ns_published == Some(true) {
                     cloud.incidents.open(crate::incidents::OpenReq {
+                        condition: "dns:api-hold".into(),
+                        ttl_ms: INCIDENT_TTL_MS,
                         title: "API delegation held: fewer than 2 proven api-capable nameservers".into(),
                         severity: crate::incidents::Severity::Major,
                         affected: vec!["dns".into()],
@@ -2552,7 +2560,10 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     });
                 }
             } else {
-                api_hold_active = false;
+                cloud.incidents.clear(
+                    "dns:api-hold",
+                    "At least two api-capable nameservers are proven again; the api delegation is no longer held.",
+                );
             }
             // During a HOLD the flat set is withheld too: child address records
             // under the live delegation would be occluded AND would veto a

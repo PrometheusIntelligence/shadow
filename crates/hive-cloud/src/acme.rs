@@ -772,20 +772,19 @@ fn read_account_sealed() -> EnvelopeOpen {
     opened
 }
 
-/// Open an incident at most ONCE per process for a static, unchanging
-/// condition. The ACME loop revisits every bundle every ~6h, so an unguarded
-/// `open` on a condition that cannot change while the process runs would append
-/// a new incident per bundle per pass, forever.
-fn incident_once(
-    fired: &std::sync::atomic::AtomicBool,
-    incidents: Option<&crate::incidents::IncidentStore>,
-    req: crate::incidents::OpenReq,
-) {
-    let Some(inc) = incidents else { return };
-    if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+/// Observation validity for the ACME loops' incidents: the platform bundle
+/// pass runs every 5–7 h and the custom-domain pass retries at a 6 h backoff
+/// ceiling, so a condition still true is re-asserted well inside 24 h and one
+/// that stopped being observed (a key fixed and the node restarted, a bundle
+/// finally issued) resolves itself a day later at the latest.
+const INCIDENT_TTL_MS: u64 = 24 * 3600 * 1000;
+
+/// Re-assert an incident for a condition the ACME loop observes on this pass
+/// (the store dedups on the condition, so per-pass is free).
+fn observe(incidents: Option<&crate::incidents::IncidentStore>, req: crate::incidents::OpenReq) {
+    if let Some(inc) = incidents {
+        inc.open(req);
     }
-    inc.open(req);
 }
 
 fn open_key_incident(incidents: Option<&crate::incidents::IncidentStore>, where_: &str) {
@@ -796,11 +795,11 @@ fn open_key_incident(incidents: Option<&crate::incidents::IncidentStore>, where_
          rotated) so this node can reuse the fleet's Let's Encrypt account instead of registering \
          another one"
     );
-    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    incident_once(
-        &FIRED,
+    observe(
         incidents,
         crate::incidents::OpenReq {
+            condition: "acme:account-key-unknown".into(),
+            ttl_ms: INCIDENT_TTL_MS,
             title: "ACME account credential is sealed under an unknown key".into(),
             severity: crate::incidents::Severity::Major,
             affected: vec!["tls".into(), "acme".into()],
@@ -969,11 +968,11 @@ async fn account(
             "ACME: registered a NEW Let's Encrypt account but could NOT store it — every future \
              pass will register another one until this is fixed"
         );
-        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        incident_once(
-            &FIRED,
+        observe(
             incidents,
             crate::incidents::OpenReq {
+                condition: "acme:account-unstorable".into(),
+                ttl_ms: INCIDENT_TTL_MS,
                 title: "ACME account credential could not be persisted".into(),
                 severity: crate::incidents::Severity::Major,
                 affected: vec!["tls".into(), "acme".into()],
@@ -1472,6 +1471,14 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
         {
             Ok(b) => {
                 streaks.write().remove(&bundle);
+                cloud.incidents.clear(
+                    &format!("acme:custom-cert-failing:{bundle}"),
+                    "HTTP-01 issuance succeeded — the bundle is installed.",
+                );
+                cloud.incidents.clear(
+                    &format!("acme:rate-limit:{bundle}"),
+                    "Issuance succeeded — the Let's Encrypt rate-limit window has opened.",
+                );
                 store_bundle_local(&bundle, &b);
                 let js = serde_json::to_vec(&b).unwrap_or_default();
                 crate::guardian::put(&guardian_key(&bundle), js).await;
@@ -1499,28 +1506,25 @@ pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
                     f
                 };
                 // Rate limits and validation failures are typed incidents,
-                // deduped per bundle per process (an unguarded `open` appends
-                // one per pass forever — the incidents store replicates).
+                // re-asserted per failing attempt (the store dedups on the
+                // condition) and cleared by the attempt that succeeds.
                 let msg = e.to_string();
                 if msg.contains("rateLimited") || msg.contains("rate limit") {
-                    static RL_FIRED: std::sync::OnceLock<
-                        parking_lot::RwLock<std::collections::HashSet<String>>,
-                    > = std::sync::OnceLock::new();
-                    let set = RL_FIRED
-                        .get_or_init(|| parking_lot::RwLock::new(std::collections::HashSet::new()));
-                    if set.write().insert(bundle.clone()) {
-                        cloud.incidents.open(crate::incidents::OpenReq {
-                            title: format!("ACME rate limit: {bundle}"),
-                            severity: crate::incidents::Severity::Major,
-                            affected: names.clone(),
-                            message: format!(
-                                "ACME rate limit for custom domain bundle {bundle}: {msg}"
-                            ),
-                        });
-                    }
-                }
-                if fails == 12 {
                     cloud.incidents.open(crate::incidents::OpenReq {
+                        condition: format!("acme:rate-limit:{bundle}"),
+                        ttl_ms: INCIDENT_TTL_MS,
+                        title: format!("ACME rate limit: {bundle}"),
+                        severity: crate::incidents::Severity::Major,
+                        affected: names.clone(),
+                        message: format!(
+                            "ACME rate limit for custom domain bundle {bundle}: {msg}"
+                        ),
+                    });
+                }
+                if fails >= 12 {
+                    cloud.incidents.open(crate::incidents::OpenReq {
+                        condition: format!("acme:custom-cert-failing:{bundle}"),
+                        ttl_ms: INCIDENT_TTL_MS,
                         title: format!("Custom domain cert failing: {bundle}"),
                         severity: crate::incidents::Severity::Minor,
                         affected: names.clone(),
@@ -1659,6 +1663,10 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                 .await
                 {
                     Ok(b) => {
+                        cloud.incidents.clear(
+                            &format!("acme:rate-limit:{bundle}"),
+                            "Issuance succeeded — the Let's Encrypt rate-limit window has opened.",
+                        );
                         store_bundle_local(&bundle, &b);
                         if forced {
                             let _ = std::fs::remove_file(&force_path); // one-shot
@@ -1684,6 +1692,8 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                         // sees the window (and that force-renewals spend it).
                         if e.to_string().contains("rateLimited") {
                             cloud.incidents.open(crate::incidents::OpenReq {
+                                condition: format!("acme:rate-limit:{bundle}"),
+                                ttl_ms: INCIDENT_TTL_MS,
                                 title: format!("ACME rate-limited by Let's Encrypt ({bundle})"),
                                 severity: crate::incidents::Severity::Major,
                                 affected: vec!["tls".into(), "acme".into()],

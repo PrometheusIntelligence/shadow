@@ -234,7 +234,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         <Mini label="Type" value={db.kind} />
         <Mini label="Region" value={db.region} />
         <Mini label="Mode" value={db.mode} />
-        <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)} ago` : "unknown"} />
+        <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)}` : "unknown"} />
       </div>
 
       {db.mode === "simulated" && (

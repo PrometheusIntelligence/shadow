@@ -295,7 +295,7 @@ function AlertsBox({ notifications }: { notifications: NotificationFeed | null }
                 <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${a.severity === "error" ? "bg-red-500" : "bg-amber-500"}`} />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-secondary">{a.message}</div>
-                  <div className="text-xs text-muted">{timeAgo(a.ts_ms)} ago</div>
+                  <div className="text-xs text-muted">{timeAgo(a.ts_ms)}</div>
                 </div>
               </div>
             ))}
@@ -330,7 +330,7 @@ function RecentPreviewsBox({ deps }: { deps: Deployment[] }) {
                   <div className="truncate font-medium">{d.project}</div>
                   <div className="truncate text-xs text-muted">{(() => { const a = deploymentSelfAlias(d); return a ? deploymentHost(a) : "preview URL pending"; })()}</div>
                 </div>
-                <span className="shrink-0 text-xs text-muted">{timeAgo(d.created_at_ms)} ago</span>
+                <span className="shrink-0 text-xs text-muted">{timeAgo(d.created_at_ms)}</span>
               </Link>
             ))}
           </div>

@@ -449,7 +449,7 @@ function SnapshotsPanel({ project, sandboxId, onChanged }: { project: string; sa
               <div className="min-w-0">
                 <div className="truncate font-mono text-xs">{s.id}</div>
                 <div className="text-xs text-secondary">
-                  {s.status} · {s.size_bytes ? `${Math.round(s.size_bytes / 1024)} KB` : "size unknown"} · {timeAgo(s.created_at)} ago
+                  {s.status} · {s.size_bytes ? `${Math.round(s.size_bytes / 1024)} KB` : "size unknown"} · {timeAgo(s.created_at)}
                   {s.expires_at ? ` · expires ${timeAgo(s.expires_at)}` : ""}
                 </div>
               </div>

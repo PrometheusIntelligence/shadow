@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { Card, Badge } from "@/components/ui";
 import { useOpsPoll, type AdminOverview, type Metrics, type Incident } from "@/lib/api";
+import { OPEN_INCIDENTS_LIMIT, OPEN_INCIDENTS_PATH } from "@/lib/incident-paths";
 
 // Tremor's AreaChart pulls in a sizeable charting dependency -- lazy-load it so
 // pages that don't render a chart (or before this one streams in) don't pay for
@@ -23,16 +24,19 @@ export function AdminOverviewClient({
   initialMetrics: Metrics | null;
   initialIncidents: Incident[] | null;
 }) {
-  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 4000, true, initialOverview);
-  const { data: metrics } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 5000, true, initialMetrics);
-  const { data: incidents } = useOpsPoll<Incident[]>("/v1/incidents", 6000, true, initialIncidents);
+  // Poll cadences match the backend's 15 s response cache for these fan-outs
+  // (POLLED_RESPONSE_CACHE_TTL): faster polling only re-reads the same entry.
+  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 10000, true, initialOverview);
+  const { data: metrics } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 10000, true, initialMetrics);
+  const { data: incidents } = useOpsPoll<Incident[]>(OPEN_INCIDENTS_PATH, 10000, true, initialIncidents);
 
   const series = (metrics?.series ?? []).map((b) => ({
     time: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     Requests: b.requests,
     Errors: b.errors + b.client_err,
   }));
-  const openIncidents = (incidents ?? []).filter((i) => i.status !== "resolved");
+  const openIncidents = (incidents ?? []).filter((i) => i.status !== "resolved").slice(0, OPEN_INCIDENTS_LIMIT);
+  const moreOpen = Math.max(0, (ov?.incidents_open ?? 0) - openIncidents.length);
   const errRate = ov ? (ov.error_rate_30m * 100).toFixed(2) : "0";
   const healthy = ov ? ov.incidents_open === 0 && ov.error_rate_30m < 0.05 : true;
 
@@ -89,9 +93,14 @@ export function AdminOverviewClient({
                     <span className="truncate text-sm font-medium">{i.title}</span>
                     <SeverityBadge s={i.severity} />
                   </div>
-                  <div className="mt-1 text-xs capitalize text-secondary">{i.status}</div>
+                  <div className="mt-1 text-xs capitalize text-secondary">{i.status}{i.origin === "automated" ? " · auto" : ""}</div>
                 </Link>
               ))}
+              {moreOpen > 0 ? (
+                <Link href="/admin/incidents" className="block text-center text-xs text-secondary hover:text-fg">
+                  +{moreOpen} more open incident{moreOpen === 1 ? "" : "s"}
+                </Link>
+              ) : null}
             </div>
           ) : (
             <div className="flex h-40 flex-col items-center justify-center gap-2 text-center text-sm text-secondary">

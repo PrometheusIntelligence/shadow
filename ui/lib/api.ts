@@ -430,6 +430,11 @@ const PATH_TTL: Array<[RegExp, number]> = [
   // interval wouldn't already tolerate.
   [/^\/v1\/metrics/, 3_000],
   [/^\/v1\/overview$/, 3_000],
+  // Ops console: the backend caches the overview fan-out for 15 s and the
+  // incident pages poll paged lists — de-dupe co-mounted readers.
+  [/^\/v1\/admin\/overview$/, 5_000],
+  [/^\/v1\/incidents(\?|$)/, 4_000],
+  [/^\/v1\/status\/incidents$/, 5_000],
   [/^\/v1\/functions$/, 3_000],
   [/^\/v1\/databases$/, 3_000],
   [/^\/v1\/integrations$/, 5_000],
@@ -1461,6 +1466,12 @@ export interface Incident {
   created_ms: number;
   updated_ms: number;
   updates: IncidentUpdate[];
+  /** `operator` = declared by a person; `automated` = a reconcile loop's
+   *  observed condition, which resolves itself once no longer observed. */
+  origin?: "operator" | "automated";
+  condition?: string;
+  observed_ms?: number;
+  expires_ms?: number;
 }
 export interface AdminOverview {
   owner: string;

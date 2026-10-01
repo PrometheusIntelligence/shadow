@@ -746,6 +746,10 @@ fn open_pull_incident(
     cloud
         .incidents
         .open(crate::incidents::OpenReq {
+            condition: format!("store-pull:{leader}:{store}"),
+            // Re-asserted on the streak cadence; the large lane pulls every
+            // 15 min, so two missed lanes lapse it.
+            ttl_ms: 30 * 60 * 1000,
             title: format!("store replication from {leader} failing: {what}"),
             severity: crate::incidents::Severity::Minor,
             affected: vec![cloud.node_name.clone(), format!("store:{store}")],
