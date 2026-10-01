@@ -3527,15 +3527,70 @@ pub(crate) async fn deployment_integrity(
 /// Publish the host subdomains this node serves + its gateway URL, so peers can
 /// build their cross-node routing tables (the mesh routes requests to wherever a
 /// deployment actually lives).
-pub(crate) async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!({
+#[derive(serde::Deserialize)]
+pub(crate) struct ServeHostsQ {
+    since: Option<u64>,
+}
+
+pub(crate) async fn serve_hosts(
+    State(c): State<Arc<CloudState>>,
+    q: Option<Query<ServeHostsQ>>,
+) -> Json<Value> {
+    Json(serve_hosts_with(&c, q.and_then(|q| q.0.since)))
+}
+
+/// This node's served hosts, or — when the caller already holds generation
+/// `since` — just its generation.
+///
+/// WHY: every peer used to fetch this node's COMPLETE host list on every gossip
+/// round. The leader publishes 2,592 hosts (56 KB), 1,501 of them immutable
+/// `dpl-<id>` urls, so steady-state gossip cost scaled with the total number of
+/// deployments ever made rather than with what actually changed. A caller that
+/// already has generation `gen` gets a few hundred bytes and keeps the routes it
+/// has; any change to the host set bumps `gen` and the next caller gets the full
+/// list once. Cost becomes O(changes), not O(hosts).
+///
+/// `containers` is always sent: it is tiny (10 on the leader) and drives lease
+/// election, so it is not worth a second round trip to discover.
+pub(crate) fn serve_hosts_with(c: &Arc<CloudState>, since: Option<u64>) -> Value {
+    // served_hosts() iterates a HashMap, so its ORDER is not stable across
+    // calls — hash a sorted copy or the generation would bump every pass and
+    // every peer would re-fetch the full list forever.
+    let mut hosts = c.gw.served_hosts();
+    hosts.sort();
+    let digest = {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for s in &hosts {
+            h.write(s.as_bytes());
+            h.write_u8(0xff); // separator: "ab"+"c" != "a"+"bc"
+        }
+        h.finish()
+    };
+    let gen = {
+        let mut last = c.route_pub_hash.write();
+        if *last != digest {
+            *last = digest;
+            c.route_pub_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        } else {
+            c.route_pub_gen.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    };
+    let mut out = json!({
         "node": c.node_name,
         "region": c.region,
         "gateway": c.public_base,
-        "hosts": c.gw.served_hosts(),
+        "gen": gen,
         // Container deployments this node holds → feeds mesh lease election.
         "containers": c.gw.container_projects(),
-    }))
+    });
+    if since == Some(gen) {
+        return out; // unchanged: no host list to ship
+    }
+    out["hosts"] = json!(hosts);
+    out
 }
 
 /// Current container placement leases across the mesh (owner + fencing epoch +

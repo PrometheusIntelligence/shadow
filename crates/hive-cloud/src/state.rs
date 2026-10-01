@@ -251,6 +251,28 @@ pub struct CloudState {
     /// (learned via gossip). Lets any node route/load-balance requests to the node
     /// that actually hosts a deployment.
     pub peer_routes: RwLock<std::collections::HashMap<String, Vec<PeerRoute>>>,
+    /// The same routing table indexed by OWNING NODE: `node -> (host -> route)`.
+    ///
+    /// The authoritative copy. `peer_routes` is a derived view rebuilt from it.
+    /// It exists because a peer's host list is fetched WHOLE every gossip round
+    /// (the leader's is 2,592 hosts / 56 KB), so the round can no longer rebuild
+    /// the table from scratch: a peer whose route set did not change now answers
+    /// with just its generation, and its previously published routes must survive
+    /// that empty answer intact instead of being dropped for having sent nothing.
+    pub peer_routes_by_node: RwLock<
+        std::collections::HashMap<String, std::collections::HashMap<String, PeerRoute>>,
+    >,
+    /// Last route generation seen from each peer NODE (client side). Sent as
+    /// `?since=` so an unchanged peer answers with a generation, not its list.
+    pub route_gens: RwLock<std::collections::HashMap<String, u64>>,
+    /// Which node id a gossip TARGET last answered for (so the next round can
+    /// ask that node for a delta before its identity is known again).
+    pub target_node: RwLock<std::collections::HashMap<String, String>>,
+    /// This node's own route generation (server side): bumped whenever the set
+    /// of hosts it serves changes. Never decreases.
+    pub route_pub_gen: std::sync::atomic::AtomicU64,
+    /// The host-set hash `route_pub_gen` was last bumped for.
+    pub route_pub_hash: RwLock<u64>,
     /// Deployments hosted on each peer node (name -> its deployments), learned via
     /// gossip. Lets the dashboard's per-project deployment list show deployments
     /// that the placement scheduler placed on OTHER nodes (e.g. the default
@@ -807,6 +829,11 @@ impl CloudState {
             peer_iroh: RwLock::new(std::collections::HashMap::new()),
             last_gossip_ok_ms: std::sync::atomic::AtomicU64::new(0),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
+        peer_routes_by_node: RwLock::new(std::collections::HashMap::new()),
+        route_gens: RwLock::new(std::collections::HashMap::new()),
+        target_node: RwLock::new(std::collections::HashMap::new()),
+        route_pub_gen: std::sync::atomic::AtomicU64::new(0),
+        route_pub_hash: RwLock::new(0),
             peer_deployments: RwLock::new(std::collections::HashMap::new()),
             git_poll_seen: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),

@@ -3926,6 +3926,16 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
 struct PeerSync {
     /// (host, route) pairs learned from this peer's serve-hosts.
     routes: Vec<(String, crate::state::PeerRoute)>,
+    /// `routes` is the peer's COMPLETE host list. False when the peer reported
+    /// its route set unchanged and sent none — its previously published routes
+    /// then stay in the table and only their liveness/transport is refreshed.
+    routes_full: bool,
+    /// The peer's route generation, present on both a full and an unchanged
+    /// answer; remembered so the next round can ask for a delta.
+    route_gen: Option<u64>,
+    /// (region, gateway, latency_ms) of the peer — carried even on an unchanged
+    /// answer so existing routes keep a current transport.
+    meta: Option<(String, String, u64)>,
     /// This peer's fleet deployments (node_id, list) for the dashboard view.
     fleet: Option<(String, Vec<fluid_core::DeploymentInfo>)>,
     /// (container key, holder node_id) pairs for lease election.
@@ -4245,9 +4255,31 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
         }
     }
     out.reached = true;
-    if let Some(bytes) =
-        gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await
+    // Ask only for what changed: if we already hold this node's route
+    // generation, the peer answers with the generation alone unless its host
+    // set moved. A peer on a pre-incremental build does not understand
+    // `?since=` and answers nothing, so fall back to the plain path once —
+    // otherwise a mixed fleet would learn no routes at all mid-roll.
+    let since = cloud
+        .target_node
+        .read()
+        .get(&peer)
+        .and_then(|n| cloud.route_gens.read().get(n).copied());
+    let hosts_path = match since {
+        Some(g) => format!("/v1/serve-hosts?since={g}"),
+        None => "/v1/serve-hosts".to_string(),
+    };
+    let mut host_bytes =
+        gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, &hosts_path, &[]).await;
+    if since.is_some()
+        && host_bytes
+            .as_deref()
+            .map_or(true, |b| serde_json::from_slice::<serde_json::Value>(b).is_err())
     {
+        host_bytes =
+            gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await;
+    }
+    if let Some(bytes) = host_bytes {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             let node_id = v
                 .get("node")
@@ -4266,7 +4298,13 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 .to_string();
             if !gateway.is_empty() && node_id != cloud.node_name {
                 out.seen = Some(node_id.clone());
+                out.meta = Some((region.clone(), gateway.clone(), rtt));
+                out.route_gen = v.get("gen").and_then(|x| x.as_u64());
+                // Remember which node this target speaks for, so the next
+                // round can ask it for a delta before its identity is known.
+                cloud.target_node.write().insert(peer.clone(), node_id.clone());
                 if let Some(hosts) = v.get("hosts").and_then(|x| x.as_array()) {
+                    out.routes_full = true;
                     for h in hosts.iter().filter_map(|x| x.as_str()) {
                         out.routes.push((
                             h.to_string(),
@@ -4572,12 +4610,10 @@ fn spawn_gossip_loop(
                 .collect();
             let contributions =
                 round_contributions(&answers, &landed_now, fanout.in_flight_keys(), &alive);
+            let now = now_ms();
             for pr in &contributions {
                 if let Some(n) = &pr.seen {
                     seen_nodes.insert(n.clone());
-                }
-                for (h, route) in &pr.routes {
-                    routes.entry(h.clone()).or_default().push(route.clone());
                 }
                 if let Some((nid, list)) = &pr.fleet {
                     fleet.insert(nid.clone(), list.clone());
@@ -4586,24 +4622,71 @@ fn spawn_gossip_loop(
                     holders.entry(k.clone()).or_default().push(nid.clone());
                 }
             }
+            // Route table: apply each reached peer's answer to the PERSISTENT
+            // per-node set, then derive the host -> routes view.
+            //
+            // This replaces "rebuild the whole table from this round's answers,
+            // then TTL-carry-forward anything from a node we did not reach".
+            // That shape is wrong once a peer may answer "unchanged": a reached
+            // node was treated as authoritative, so an empty answer wiped every
+            // route it had ever published and the deployment 404'd until the
+            // next full snapshot. Now a full snapshot REPLACES a node's set and
+            // an unchanged report only refreshes it; a node's routes are dropped
+            // solely when nothing about it has been seen within ROUTE_TTL_MS.
+            {
+                let mut by_node = cloud.peer_routes_by_node.write();
+                let mut gens = cloud.route_gens.write();
+                for pr in &contributions {
+                    let Some(n) = pr.seen.clone() else { continue };
+                    if pr.routes_full {
+                        let mut set = std::collections::HashMap::new();
+                        for (h, route) in &pr.routes {
+                            set.insert(h.clone(), route.clone());
+                        }
+                        by_node.insert(n.clone(), set);
+                    } else if let Some(set) = by_node.get_mut(&n) {
+                        if let Some((region, gateway, latency)) = &pr.meta {
+                            for r in set.values_mut() {
+                                r.region = region.clone();
+                                r.gateway = gateway.clone();
+                                r.latency_ms = *latency;
+                                r.last_seen_ms = now;
+                            }
+                        }
+                    }
+                    if let Some(g) = pr.route_gen {
+                        gens.insert(n.clone(), g);
+                    }
+                }
+                by_node.retain(|n, set| {
+                    if seen_nodes.contains(n) {
+                        return true;
+                    }
+                    set.retain(|_, r| now.saturating_sub(r.last_seen_ms) < crate::state::ROUTE_TTL_MS);
+                    !set.is_empty()
+                });
+                // Forget generations for nodes that aged out entirely, so a
+                // returning node is re-fetched in full rather than resumed from
+                // a stale generation.
+                gens.retain(|n, _| by_node.contains_key(n));
+            }
             // Replicated zkauth rosters are rebuilt from scratch each cycle (so peer
             // revocations converge) and swapped whole.
             #[cfg(feature = "zkauth")]
             crate::zkauth::set_peer_exports(
                 contributions.iter().filter_map(|pr| pr.zk_roster.as_ref()),
             );
-            // #24: TTL-merge routes so a route from a peer we briefly couldn't reach
-            // this round survives (up to ROUTE_TTL_MS) instead of vanishing and
-            // 404-ing the deployment; reached peers' routes are still authoritative.
+            // Derived view: host -> every peer that serves it.
             let merged = {
-                let prev = cloud.peer_routes.read().clone();
-                crate::state::merge_routes_ttl(
-                    &prev,
-                    routes,
-                    &seen_nodes,
-                    now_ms(),
-                    crate::state::ROUTE_TTL_MS,
-                )
+                let by_node = cloud.peer_routes_by_node.read();
+                let mut m: std::collections::HashMap<String, Vec<crate::state::PeerRoute>> =
+                    std::collections::HashMap::new();
+                for set in by_node.values() {
+                    for (h, r) in set {
+                        m.entry(h.clone()).or_default().push(r.clone());
+                    }
+                }
+                m
             };
             *cloud.peer_routes.write() = merged;
             // TTL-merge fleet deployments too (same rationale as routes): a single missed

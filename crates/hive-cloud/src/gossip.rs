@@ -200,7 +200,17 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        "/v1/serve-hosts" => jb(crate::admin::serve_hosts(State(cloud.clone())).await),
+        // `?since=<gen>` is the incremental form (see admin::serve_hosts_with):
+        // a peer that already holds this node's generation gets a generation and
+        // no host list. Accepted here as well as on the HTTP route so both
+        // transports stay byte-equivalent.
+        p if p == "/v1/serve-hosts" || p.starts_with("/v1/serve-hosts?") => {
+            let since = p
+                .split_once("since=")
+                .and_then(|(_, v)| v.split('&').next())
+                .and_then(|v| v.parse::<u64>().ok());
+            jb(axum::Json(crate::admin::serve_hosts_with(&cloud, since)))
+        }
         // Full TeamStore snapshot for the leader->follower teams sync (see
         // spawn_relational_mirror_loop's follower branch). Team mutations only
         // ever land on the control-plane leader (admin_ingress forward), so a
