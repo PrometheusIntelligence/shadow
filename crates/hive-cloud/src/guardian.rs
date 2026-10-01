@@ -556,20 +556,8 @@ pub fn init_background() {
 /// used by the restore-on-rollback guard.
 static NODE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Handle of the main tokio runtime, captured at boot. `replicate` is called
-/// from the dedicated `hive-persister` OS thread, which has NO runtime context —
-/// a bare `tokio::spawn` there panics ("must be called from the context of a
-/// Tokio runtime"), killing the persister thread and silently dropping every
-/// periodic GuardianDB replication. Spawn onto this handle instead.
-static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
-
 pub fn set_node_name(name: &str) {
     let _ = NODE_NAME.set(name.to_string());
-    // Called from async main → the runtime is current here; remember it for
-    // spawns from non-runtime threads (the persister).
-    if let Ok(h) = tokio::runtime::Handle::try_current() {
-        let _ = RUNTIME.set(h);
-    }
 }
 
 fn snapshot_key() -> Option<String> {
@@ -4505,8 +4493,22 @@ async fn replication_writer(
     }
 }
 
+/// Start the writer on the BULKHEAD runtime, never the serving one.
+///
+/// Measured and adversarially verified 2026-10-01: `write_replication_batch`
+/// re-decompresses, re-parses, re-canonicalizes and fully reconstructs the
+/// whole snapshot TWICE per admitted generation (~6-16 s of synchronous CPU at
+/// the fleet's 40-75 s generation cadence = 10-40 % sustained duty), all as
+/// plain sync code between awaits — no `spawn_blocking`, no yield. It was the
+/// best match for the second CPU-hot worker in the leader's freeze capture.
+///
+/// It holds no lock the request path or timers need, so it never stalled the
+/// runtime on its own (the SQL mirror was the actual freeze mechanism). But a
+/// chronically hot SERVING worker is exactly the class of bug that must not
+/// live there, and moving it costs nothing: `bulkhead::spawn` holds its own
+/// runtime handle, so it also works from the `hive-persister` OS thread, which
+/// has no runtime context — the reason this used to capture the main handle.
 fn ensure_replication_writer(
-    runtime: &tokio::runtime::Handle,
     initial: Arc<DesiredReplication>,
 ) -> &'static tokio::sync::watch::Sender<Arc<DesiredReplication>> {
     REPLICATION_QUEUE.get_or_init(|| {
@@ -4514,7 +4516,7 @@ fn ensure_replication_writer(
         let shutdown = REPLICATION_SHUTDOWN
             .get_or_init(tokio_util::sync::CancellationToken::new)
             .clone();
-        let task = runtime.spawn(replication_writer(receiver, shutdown));
+        let task = crate::bulkhead::spawn(replication_writer(receiver, shutdown));
         let slot = REPLICATION_WRITER.get_or_init(|| std::sync::Mutex::new(None));
         *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
         sender
@@ -4524,14 +4526,6 @@ fn ensure_replication_writer(
 /// Admit one exact replication generation. Once shutdown closes admission this
 /// returns `None`; no caller can enqueue work behind the final drain target.
 pub fn replicate(snap: &PlatformSnapshot) -> Option<u64> {
-    let runtime = tokio::runtime::Handle::try_current()
-        .ok()
-        .or_else(|| RUNTIME.get().cloned());
-    let Some(runtime) = runtime else {
-        tracing::error!("no tokio runtime; Guardian replication generation was not admitted");
-        return None;
-    };
-
     let mut lifecycle = replication_lifecycle()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4575,7 +4569,7 @@ pub fn replicate(snap: &PlatformSnapshot) -> Option<u64> {
         lifecycle.statuses.remove(&oldest);
         lifecycle.failures.remove(&oldest);
     }
-    let sender = ensure_replication_writer(&runtime, desired.clone());
+    let sender = ensure_replication_writer(desired.clone());
     publish_replication(sender, desired);
     drop(lifecycle);
     replication_notify().notify_waiters();
