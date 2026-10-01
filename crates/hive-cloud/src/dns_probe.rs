@@ -223,6 +223,132 @@ fn fmt_subnet(cs: &ClientSubnet) -> String {
 /// Late/stray datagrams that don't match our query id are skipped rather than
 /// treated as the answer, but the whole receive window is bounded by a single
 /// deadline so a chatty or hostile peer cannot hold the probe open.
+/// TXT values `target` answers AUTHORITATIVELY for `qname`.
+///
+/// Exists for ACME DNS-01 on a zone delegated to this fleet's own nameservers:
+/// Let's Encrypt queries a RANDOM one of them, so a challenge present on one
+/// server and missing from another fails validation intermittently. Measured
+/// 2026-10-01 — the `deploy` zone's challenge was served by 1 of 4 NS and the
+/// order went `Invalid`. A public resolver cannot detect this: it caches and
+/// asks one server, so one success masks the rest. The only honest check is to
+/// ask every nameserver directly, which is what [`super::acme`] now does.
+pub async fn txt_values(
+    target: SocketAddr,
+    qname: &str,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let bind: SocketAddr = if target.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let sock = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("bind: {e}"))?;
+    sock.connect(target)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let id = uuid::Uuid::new_v4().as_u128() as u16;
+    let msg = build_query(id, qname, 16, None);
+    sock.send(&msg).await.map_err(|e| format!("send: {e}"))?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = vec![0u8; 1500];
+    loop {
+        let n = match tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await {
+            Err(_) => return Err("timeout".into()),
+            Ok(Err(e)) => return Err(format!("recv: {e}")),
+            Ok(Ok(n)) => n,
+        };
+        match parse_txt(id, &buf[..n]) {
+            Err(e) if e == "id-mismatch" => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Parse the TXT answers of a response, rejecting anything a real resolver
+/// would reject: id mismatch, non-authoritative, non-zero rcode, truncation.
+fn parse_txt(id: u16, msg: &[u8]) -> Result<Vec<String>, String> {
+    let bad = |s: &str| Err(s.to_string());
+    if msg.len() < 12 {
+        return bad("short-response");
+    }
+    if [msg[0], msg[1]] != id.to_be_bytes() {
+        return bad("id-mismatch");
+    }
+    if msg[2] & 0x80 == 0 {
+        return bad("not-a-response");
+    }
+    if msg[2] & 0x04 == 0 {
+        return bad("not-authoritative");
+    }
+    let rcode = msg[3] & 0x0F;
+    if rcode != 0 {
+        return Err(format!("rcode={}", rcode_name(rcode)));
+    }
+    let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+    let ancount = u16::from_be_bytes([msg[6], msg[7]]);
+    let mut off = 12usize;
+    for _ in 0..qdcount {
+        loop {
+            if off >= msg.len() {
+                return bad("truncated-question");
+            }
+            let l = msg[off] as usize;
+            off += 1;
+            if l == 0 {
+                break;
+            }
+            off += l;
+        }
+        off += 4;
+    }
+    let mut out = Vec::new();
+    for _ in 0..ancount {
+        loop {
+            if off >= msg.len() {
+                return bad("truncated-answer");
+            }
+            let l = msg[off] as usize;
+            if l & 0xC0 == 0xC0 {
+                off += 2;
+                break;
+            }
+            off += 1;
+            if l == 0 {
+                break;
+            }
+            off += l;
+        }
+        if off + 10 > msg.len() {
+            return bad("truncated-rr");
+        }
+        let rtype = u16::from_be_bytes([msg[off], msg[off + 1]]);
+        let rdlen = u16::from_be_bytes([msg[off + 8], msg[off + 9]]) as usize;
+        let start = off + 10;
+        if start + rdlen > msg.len() {
+            return bad("truncated-rdata");
+        }
+        if rtype == 16 {
+            // RFC 1035: TXT rdata is one or more <length><bytes>.
+            let mut i = 0usize;
+            let mut v = String::new();
+            while i < rdlen {
+                let l = msg[start + i] as usize;
+                i += 1;
+                if i + l > rdlen {
+                    break;
+                }
+                v.push_str(&String::from_utf8_lossy(&msg[start + i..start + i + l]));
+                i += l;
+            }
+            out.push(v);
+        }
+        off = start + rdlen;
+    }
+    Ok(out)
+}
+
 pub async fn probe_query(
     target: SocketAddr,
     qname: &str,

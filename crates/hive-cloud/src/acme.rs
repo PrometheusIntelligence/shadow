@@ -562,6 +562,69 @@ pub fn challenge_record_name(identifier: &str, zone: &str) -> String {
 /// Poll public DNS (DoH against Google + Cloudflare — reqwest, no new deps) until
 /// the TXT value is visible, or time out (~2 min). Vercel's nameservers publish
 /// fast; the wait is for their anycast propagation.
+/// Poll EVERY authoritative nameserver of a fleet-served zone until the
+/// challenge is visible on all of them, or time out (~2 min).
+///
+/// This is the check `wait_txt` cannot make. A zone delegated to this fleet has
+/// several NS and Let's Encrypt picks one at random, so "a resolver saw it" is
+/// not evidence — one of four servers held the `deploy` challenge while the
+/// order went `Invalid`. Public resolvers make it worse by caching a single
+/// server's answer. Ask each NS directly and require unanimity before telling
+/// Let's Encrypt the challenge is ready.
+async fn wait_txt_all_ns(cloud: &Arc<CloudState>, fqdn: &str, value: &str) -> bool {
+    let ns: Vec<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        // A nameserver this fleet actually publishes: it advertises a public
+        // `:53` (`dns_ns`) AND peers in at least two regions have attested it
+        // answers (`dns_attest`), which is the same proof-before-advertise rule
+        // the DNS reconciler uses to build the NS set LE will query.
+        .filter(|n| n.dns_ns.is_some() && n.dns_attest.len() >= 2)
+        .filter_map(|n| n.public_ip.clone())
+        .collect();
+    if ns.is_empty() {
+        return false;
+    }
+    for i in 0..24 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for ip in &ns {
+            let addr = match ip.parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => match format!("{ip}:53").parse::<std::net::SocketAddr>() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        missing.push(ip.clone());
+                        continue;
+                    }
+                },
+            };
+            match crate::dns_probe::txt_values(
+                addr,
+                fqdn,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            {
+                Ok(vals) if vals.iter().any(|v| v == value) => {}
+                Ok(_) => missing.push(ip.clone()),
+                Err(e) => missing.push(format!("{ip} ({e})")),
+            }
+        }
+        if missing.is_empty() {
+            tracing::info!(%fqdn, ns = ns.len(), "ACME dns-01 TXT visible on every fleet nameserver — order can be validated");
+            return true;
+        }
+        if i % 6 == 5 {
+            tracing::info!(%fqdn, missing = ?missing, "still waiting for ACME TXT to reach every fleet nameserver…");
+        }
+    }
+    false
+}
+
 async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
     for i in 0..24 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -993,6 +1056,11 @@ async fn account(
 /// validate → CSR (rcgen) → finalize → certificate chain. Cleans its TXT records
 /// up afterwards (best-effort).
 async fn issue(
+    // The fleet's own nameservers, when the caller has them: required to gate a
+    // DNS-01 challenge on EVERY authoritative NS under a live Seer delegation.
+    // `None` (the Vercel-hosted staging test) falls back to the public-resolver
+    // check, correct there because Vercel is a single anycast authority.
+    cloud: Option<&Arc<CloudState>>,
     http: &reqwest::Client,
     api: &VercelApi,
     names: &[String],
@@ -1083,7 +1151,20 @@ async fn issue(
     // Wait until the TXT records are publicly visible.
     for (rec_name, value) in &txt_names {
         let fqdn = format!("{rec_name}.{zone}");
-        if !wait_txt(http, &fqdn, value).await {
+        // Under a live Seer delegation the fleet's own nameservers are the
+        // authority LE will query, so they ALL must hold the challenge; the
+        // public-resolver check below cannot see a partial rollout.
+        let under = |z: Option<&str>| {
+            z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}")))
+                .unwrap_or(false)
+        };
+        let seer_delegated = cloud.is_some()
+            && (under(crate::dnsserver::deploy_zone()) || under(crate::dnsserver::api_zone()));
+        let visible = match (seer_delegated, cloud) {
+            (true, Some(c)) => wait_txt_all_ns(c, &fqdn, value).await,
+            _ => wait_txt(http, &fqdn, value).await,
+        };
+        if !visible {
             tracing::warn!(%fqdn, "TXT not observed via DoH in time — proceeding anyway (LE queries the authoritative NS directly)");
         }
     }
@@ -1652,7 +1733,7 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                     continue;
                 }
                 tracing::info!(%bundle, ?names, forced, "ACME: issuing/renewing certificate bundle");
-                match issue(
+                match issue(Some(&cloud), 
                     &cloud.http,
                     &api,
                     &names,
@@ -2192,7 +2273,7 @@ mod tests {
         let apps = std::env::var("HIVE_APPS_DOMAIN").unwrap_or_else(|_| "shadw.app".into());
         let names = vec![format!("*.{apps}"), apps.clone()];
         let challenges = AcmeChallengeStore::new();
-        let bundle = issue(&http, &api, &names, &apps, &challenges, None)
+        let bundle = issue(None, &http, &api, &names, &apps, &challenges, None)
             .await
             .expect("staging issuance failed");
         assert!(bundle.chain_pem.contains("BEGIN CERTIFICATE"));
