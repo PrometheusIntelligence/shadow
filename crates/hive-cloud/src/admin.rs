@@ -528,6 +528,7 @@ pub async fn admin_rate_limit(
 /// `x-hive-internal` (constant-time compare) — stricter than `mint_allowed`
 /// (no dev-mode open case), and rate-limited by the same tight mint limiter.
 async fn tls_bundle_mesh(
+    State(c): State<Arc<CloudState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -548,7 +549,7 @@ async fn tls_bundle_mesh(
         return Err((StatusCode::FORBIDDEN, "internal token required".into()));
     }
     let name = q.get("name").map(String::as_str).unwrap_or("");
-    let bytes = crate::acme::bundle_for_mesh(name);
+    let bytes = crate::acme::bundle_for_mesh(&c, name);
     if bytes.is_empty() {
         return Err((StatusCode::NOT_FOUND, "no such bundle".into()));
     }

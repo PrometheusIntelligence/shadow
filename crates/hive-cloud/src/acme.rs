@@ -2076,13 +2076,19 @@ async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
 /// immediately re-encrypts with ITS OWN node key before touching disk. This is
 /// the distribution path that actually works cross-node — per-node AEAD keys
 /// mean a replicated *ciphertext* is undecryptable on peers.
-pub fn bundle_for_mesh(bundle: &str) -> Vec<u8> {
-    // Allowlist the known bundles served cross-node. `db` (the `*.{db_domain}`
-    // wildcard fronting the per-tenant DB gateway) MUST be here too — a DB placed
-    // on any non-leader node needs the cert locally to complete the TLS handshake,
-    // and without this the follower's `mesh_fetch("db")` gets an empty reply and the
-    // gateway can't serve `<slug>.{db_domain}` off the leader.
-    if bundle != "apps" && bundle != "platform" && bundle != "db" && !bundle.starts_with("dom-") {
+pub fn bundle_for_mesh(cloud: &Arc<CloudState>, bundle: &str) -> Vec<u8> {
+    // Serve any bundle THIS node manages, plus per-tenant custom-domain bundles.
+    //
+    // The allowlist is DERIVED from `bundles()`, never hardcoded. It used to name
+    // `apps`/`platform`/`db` literally, so every bundle added to `bundles()` also
+    // had to be added here — and `deploy` was not (2026-10-01). Followers then got
+    // `404 no such bundle` from every node, the guardian replica is uninstallable
+    // off the writer (foreign AEAD key), and so the deploy certificate could never
+    // sync: previews under it failed TLS on every node except the issuer. Every
+    // new bundle would have repeated this. One source of truth removes the class.
+    let known: std::collections::HashSet<String> =
+        bundles(cloud).into_iter().map(|(name, ..)| name).collect();
+    if !known.contains(bundle) && !bundle.starts_with("dom-") {
         return Vec::new();
     }
     let Some(b) = load_bundle_local(bundle) else {

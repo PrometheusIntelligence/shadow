@@ -428,7 +428,7 @@ async fn dispatch_verified(
                 .split_once("name=")
                 .map(|(_, n)| n.split('&').next().unwrap_or(n))
                 .unwrap_or("");
-            crate::acme::bundle_for_mesh(name)
+            crate::acme::bundle_for_mesh(&cloud, name)
         }
         // NON-SECRET directory of gateway-addressable DBs hosted on this node
         // ({id, db_host, host_node, kind} — no credentials). The DNS leader fans
