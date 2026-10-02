@@ -493,8 +493,40 @@ pub struct LiteboxBackend {
     /// delivery and a cold start must never write or reap the same immutable
     /// generation concurrently; request-driven acquisition stays outside it.
     artifact_lock: Arc<AsyncMutex<()>>,
+    /// Memo of app archives whose bytes were ALREADY hash-verified against the
+    /// committed identity, keyed by image. A cold start used to hash the whole
+    /// archive (hundreds of MB) up to three times — once in
+    /// `runtime_artifact_identity`, again in `provision_runtime`'s re-derive,
+    /// again while staging the runtime tar — and every one of them sat under
+    /// `artifact_lock`, serializing the node's cold starts. The hash result is
+    /// invariant for as long as the reference and the archive file are the same
+    /// bytes, so it is remembered instead of recomputed. See
+    /// [`VerifiedArchive`] for what makes a hit safe.
+    verified_archives: Arc<std::sync::Mutex<HashMap<String, VerifiedArchive>>>,
     sampler: Arc<crate::CpuSampler>,
 }
+
+/// Proof that an app archive's bytes matched its committed SHA-256, plus the
+/// file identity that proof was taken against.
+///
+/// A hit requires ALL of: the same reference JSON bytes, the same archive file
+/// (dev/ino/len/mtime — exactly what `sha256_open_file` re-validates around its
+/// own hash), the same expected SHA, and a verification younger than
+/// [`VERIFIED_ARCHIVE_TTL_MS`]. Any change to the reference or to the archive
+/// file forces a re-hash; the TTL bounds staleness if a writer ever restores
+/// metadata. The content comparison is never skipped — it is remembered.
+struct VerifiedArchive {
+    reference_sha256: String,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: i128,
+    archive_sha256: String,
+    verified_at_ms: u64,
+}
+
+/// How long a verified archive stays trusted before its hash is redone.
+const VERIFIED_ARCHIVE_TTL_MS: u64 = 300_000;
 
 /// The Node bind-rewrite shim's source, embedded at compile time so the
 /// runtime binary is fully self-contained (no separate ansible deploy step
@@ -1068,6 +1100,133 @@ async fn sha256_open_file(file: &File) -> anyhow::Result<String> {
     .context("litebox artifact hashing task failed")?
 }
 
+/// File identity as `sha256_open_file` validates it: dev/ino/len/mtime. `None`
+/// when the file cannot be stat'd (caller must then hash).
+fn archive_stamp(path: &std::path::Path) -> Option<(u64, u64, u64, i128)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((
+        m.dev(),
+        m.ino(),
+        m.len(),
+        (m.mtime() as i128) * 1_000_000_000i128 + (m.mtime_nsec() as i128),
+    ))
+}
+
+/// True when this archive's bytes were already verified against `expected`
+/// and nothing about the reference or the file has changed since.
+fn verified_archive_hit(
+    memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>,
+    image: &str,
+    reference_sha256: &str,
+    stamp: Option<(u64, u64, u64, i128)>,
+    expected: &str,
+    now_ms: u64,
+) -> bool {
+    let Some((dev, ino, len, mtime_ns)) = stamp else {
+        return false;
+    };
+    let Ok(m) = memo.lock() else { return false };
+    match m.get(image) {
+        Some(v) => {
+            v.reference_sha256 == reference_sha256
+                && v.archive_sha256 == expected
+                && v.dev == dev
+                && v.ino == ino
+                && v.len == len
+                && v.mtime_ns == mtime_ns
+                && now_ms.saturating_sub(v.verified_at_ms) < VERIFIED_ARCHIVE_TTL_MS
+        }
+        None => false,
+    }
+}
+
+/// A verified app archive that stops being current (reference changed, file
+/// replaced, TTL lapsed) is dropped, never served stale.
+fn forget_verified_archive(memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>, image: &str) {
+    if let Ok(mut m) = memo.lock() {
+        m.remove(image);
+    }
+}
+
+fn remember_verified_archive(
+    memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>,
+    image: &str,
+    reference_sha256: &str,
+    stamp: Option<(u64, u64, u64, i128)>,
+    expected: &str,
+    now_ms: u64,
+) {
+    let Some((dev, ino, len, mtime_ns)) = stamp else { return };
+    if let Ok(mut m) = memo.lock() {
+        // Bounded: one entry per image a node has actually launched.
+        m.insert(
+            image.to_string(),
+            VerifiedArchive {
+                reference_sha256: reference_sha256.to_string(),
+                dev,
+                ino,
+                len,
+                mtime_ns,
+                archive_sha256: expected.to_string(),
+                verified_at_ms: now_ms,
+            },
+        );
+    }
+}
+
+/// Open an app archive whose bytes match the committed identity, re-hashing
+/// only when the memo cannot vouch for this exact file.
+///
+/// Two call sites hash the same archive during one cold start
+/// (`runtime_artifact_identity` and `start_function`), and a third
+/// (`provision_runtime`) re-derives the identity the caller just resolved. All
+/// three funnel through here so the archive is hashed ONCE per deployment per
+/// [`VERIFIED_ARCHIVE_TTL_MS`] instead of up to three times per launch. The
+/// comparison itself is never skipped — only its recomputation.
+async fn verified_app_archive(
+    memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>,
+    image: &str,
+    directory: &ArtifactDirectory,
+    reference: &LiteboxImageReference,
+) -> anyhow::Result<File> {
+    let expected = reference.app_archive_sha256.as_str();
+    let reference_sha256 = {
+        use sha2::Digest as _;
+        let canonical = serde_json::to_vec(reference)
+            .context("serialize litebox image reference for the verify memo")?;
+        format!("{:x}", sha2::Sha256::digest(&canonical))
+    };
+    let name = LiteboxBackend::app_archive_name(expected);
+    let stamp = archive_stamp(&directory.path.join(&name));
+    let now_ms = hive_core::now_ms();
+    if verified_archive_hit(memo, image, &reference_sha256, stamp, expected, now_ms) {
+        return directory.open_regular(&name).map_err(|error| {
+            anyhow::anyhow!(
+                "open immutable litebox artifact {}/{}: {error}",
+                directory.path.display(),
+                name.to_string_lossy()
+            )
+        });
+    }
+    forget_verified_archive(memo, image);
+    let started = std::time::Instant::now();
+    let file = verify_immutable_open(directory, &name, expected).await?;
+    let verify_ms = started.elapsed().as_millis();
+    remember_verified_archive(memo, image, &reference_sha256, stamp, expected, now_ms);
+    if verify_ms >= 50 {
+        // Visible on purpose: this is the cost a cold start pays once per
+        // deployment per node (and per TTL) instead of once per launch.
+        tracing::info!(
+            image = %image,
+            bytes = stamp.map(|(_, _, len, _)| len).unwrap_or(0),
+            verify_ms,
+            "litebox: hash-verified the app archive"
+        );
+    }
+    Ok(file)
+}
+
 async fn verify_immutable_open(
     directory: &ArtifactDirectory,
     name: &OsStr,
@@ -1329,6 +1488,7 @@ impl LiteboxBackend {
             cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
             net_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             artifact_lock: Arc::new(AsyncMutex::new(())),
+            verified_archives: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
@@ -2004,14 +2164,27 @@ impl LiteboxBackend {
         .await?;
         if let Some(cached) = reference.runtimes.get(runtime_key) {
             if cached.source_sha256 == source_sha256 {
-                if let Ok(file) = verify_immutable_open(
+                match verify_immutable_open(
                     &directories.runtimes,
                     &Self::runtime_archive_name(&cached.archive_sha256),
                     &cached.archive_sha256,
                 )
                 .await
                 {
-                    return Ok(file);
+                    Ok(file) => return Ok(file),
+                    Err(error) => {
+                        // Loud, not silent: a cached runtime archive that fails
+                        // its own hash means the on-disk bytes changed after
+                        // publication. Rebuilding below is the right recovery,
+                        // but it used to happen with no trace at all, so a
+                        // corrupted or tampered cache looked like a slow build.
+                        tracing::warn!(
+                            runtime_key = %runtime_key,
+                            archive_sha256 = %cached.archive_sha256,
+                            error = %error,
+                            "cached runtime archive failed verification; rebuilding it"
+                        );
+                    }
                 }
             }
         }
@@ -4669,10 +4842,14 @@ impl CellBackend for LiteboxBackend {
         let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES)?;
         let reference: LiteboxImageReference = serde_json::from_slice(&bytes)?;
         validate_image_reference(&reference, image)?;
-        verify_immutable_open(
+        // Hash-verified once per deployment per TTL; every later launch of the
+        // same deployment (and `provision_runtime`'s re-derive of this very
+        // identity) reuses that proof instead of re-reading the whole archive.
+        let _archive = verified_app_archive(
+            &self.verified_archives,
+            image,
             &directories.apps,
-            &Self::app_archive_name(&reference.app_archive_sha256),
-            &reference.app_archive_sha256,
+            &reference,
         )
         .await?;
         directories.verify_bindings()?;
@@ -4820,10 +4997,11 @@ impl CellBackend for LiteboxBackend {
                 func.runtime
             )));
         }
-        let app_archive = verify_immutable_open(
+        let app_archive = verified_app_archive(
+            &self.verified_archives,
+            &cell.image,
             &directories.apps,
-            &Self::app_archive_name(&reference.app_archive_sha256),
-            &reference.app_archive_sha256,
+            &reference,
         )
         .await?;
         let DirectLaunch {
