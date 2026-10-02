@@ -31,7 +31,7 @@ pub use iroh::Endpoint;
 /// and `GET /v1/mesh/discovery` read it). See the module docs for what becomes
 /// publicly resolvable and every env flag that gates it.
 pub mod dht;
-mod establish;
+pub mod establish;
 pub mod private_path;
 
 pub use establish::{establish_stats, ClassCounts, ClassLimits, EstablishStats, PeerBudget};

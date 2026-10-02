@@ -368,6 +368,30 @@ pub struct EstablishStats {
 }
 
 /// Snapshot the establishment counters over the last `window_secs`.
+/// Live connections this process holds to `peer_id` (matched against the
+/// [`PeerBudget::peer`] short form / full endpoint id keys).
+///
+/// Placement uses this to tell "advertises an address" apart from "actually
+/// reachable". A NAT'd peer may advertise only an RFC1918 address and no relay,
+/// which no remote coordinator can dial — but a peer that dialled OUT to us
+/// (which NAT permits) leaves a live trunk we can use in both directions, so the
+/// path is real even though the advertised address is not.
+pub fn peer_conns(peer_id: &str) -> usize {
+    if peer_id.is_empty() {
+        return 0;
+    }
+    if let Some(budgets) = lock(&INBOUND).clone() {
+        for counts in [&budgets.fleet_peers, &budgets.browser_peers] {
+            for (peer, conns) in lock(counts).clone() {
+                if peer_id.starts_with(&peer) || peer.starts_with(peer_id) {
+                    return conns;
+                }
+            }
+        }
+    }
+    0
+}
+
 pub fn establish_stats(window_secs: u64) -> EstablishStats {
     let now = now_ms();
     let window_secs = window_secs.clamp(BUCKET_SECS, BUCKET_SECS * HORIZON_BUCKETS);

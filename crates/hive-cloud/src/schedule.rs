@@ -352,13 +352,37 @@ fn target_of(cloud: &Arc<CloudState>, n: &NodeInfo) -> Target {
     }
 }
 
+/// True when some path to `n` can actually carry traffic: a public address, a
+/// relay in its advertised iroh address, or a live trunk to us.
+///
+/// A peer id plus an iroh address is NOT by itself evidence of reachability — a
+/// NAT'd node can advertise only an RFC1918 address and no relay, which no
+/// remote coordinator can dial. Placing on such a node succeeds and then the
+/// dispatch hangs, which is strictly worse than refusing it up front. A peer
+/// that dialled out to us leaves a live trunk, so that case is admitted.
+fn dialable(n: &NodeInfo) -> bool {
+    if n.public_ip.is_some() || n.public_ip6.is_some() {
+        return true;
+    }
+    if n
+        .iroh_addr
+        .as_deref()
+        .is_some_and(|a| a.contains("\"Relay\""))
+    {
+        return true;
+    }
+    n.peer_id
+        .as_deref()
+        .is_some_and(|id| hive_p2p::establish::peer_conns(id) > 0)
+}
+
 /// A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
 /// over the iroh mesh (has a peer id + dialable address). The last case is what lets
 /// a NAT'd coordinator place deploys on FC nodes after the SSH tunnels were cut.
 fn reachable(cloud: &Arc<CloudState>, n: &NodeInfo) -> bool {
     n.name == cloud.node_name
         || cloud.node_admins.read().contains_key(&n.name)
-        || (n.peer_id.is_some() && n.iroh_addr.is_some())
+        || (n.peer_id.is_some() && n.iroh_addr.is_some() && dialable(n))
 }
 
 /// Capability filter. Containers run through host podman on every backend;
@@ -856,7 +880,7 @@ pub fn place(
 /// capable nodes were all unreachable read as "8 capable node(s), 5 in your
 /// region(s), and the platform refuses anyway" — pointing the tenant at a
 /// missing BuildExecutor when the real cause was node health.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct BuildPlacementDiagnosis {
     /// Nodes known to the mesh that can run repository build commands at all:
     /// an isolated BuildExecutor v1, or a host-exec mock/litebox backend that
@@ -894,8 +918,13 @@ fn placement_blocker(
         return Some("unhealthy (its mesh health probe is failing)".to_string());
     }
     if !reachable(cloud, n) {
+        if n.peer_id.is_none() || n.iroh_addr.is_none() {
+            return Some(
+                "unreachable from this coordinator (no admin URL and no mesh address)".to_string(),
+            );
+        }
         return Some(
-            "unreachable from this coordinator (no admin URL and no mesh address)".to_string(),
+            "advertises no dialable path (no public address, no relay, and no live mesh connection)".to_string(),
         );
     }
     if needs_gpu && n.gpu_count == 0 {

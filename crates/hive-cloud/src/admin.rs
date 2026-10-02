@@ -324,6 +324,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/speed-insights", get(speed_insights_get))
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
+        // Placement diagnosis: why each node would or would not accept a build.
+        // Lets an operator see the real constraint instead of a bare
+        // "nothing eligible" refusal (and confirms NAT'd peers are placeable).
+        .route("/v1/admin/placement", get(admin_placement))
         .route(
             "/v1/admin/audit",
             get(admin_audit).layer(tower_http::compression::CompressionLayer::new()),
@@ -8180,6 +8184,47 @@ async fn mesh_establish(
 
 /// This node's tokio-runtime stall counters (`runtime_watch`). Node-local by
 /// nature -- every node reports its own runtime.
+#[derive(serde::Deserialize)]
+struct PlacementQ {
+    /// Comma-separated region codes; empty = every region.
+    region: Option<String>,
+    container: Option<String>,
+    gpu: Option<String>,
+    runtime_artifact: Option<String>,
+    toolchain: Option<String>,
+}
+
+fn flag(v: Option<&String>) -> bool {
+    v.map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+async fn admin_placement(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Query(q): Query<PlacementQ>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let regions: Vec<String> = q
+        .region
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let diag = crate::schedule::build_placement_diagnosis(
+        &c,
+        &regions,
+        flag(q.container.as_ref()),
+        flag(q.gpu.as_ref()),
+        false,
+        flag(q.runtime_artifact.as_ref()),
+        q.toolchain.as_deref(),
+    );
+    Ok(Json(json!(diag)))
+}
+
 async fn admin_runtime(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
