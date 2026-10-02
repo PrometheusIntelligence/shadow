@@ -700,6 +700,22 @@ impl Drop for StagedDeployment {
         Ambiguous,
     }
 
+    impl WarmHost {
+        /// Stable log/metric token for the outcome.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                WarmHost::Started => "started",
+                WarmHost::AlreadyWarm => "already-warm",
+                WarmHost::Refused => "refused",
+                WarmHost::Failed => "failed",
+                WarmHost::NotServed => "not-served",
+                WarmHost::NotReady => "not-ready",
+                WarmHost::NothingToWarm => "static",
+                WarmHost::Ambiguous => "ambiguous",
+            }
+        }
+    }
+
 impl Gateway {
     pub fn new(fluid: Arc<Fluid>, image: String) -> Arc<Gateway> {
         let runtime_artifact_store = std::env::var_os("HIVE_DATA")

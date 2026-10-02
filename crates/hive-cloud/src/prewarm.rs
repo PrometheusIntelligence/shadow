@@ -50,6 +50,66 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static DUPES: AtomicU64 = AtomicU64::new(0);
 static FORWARDED: AtomicU64 = AtomicU64::new(0);
 
+/// Outcome counts since the last summary line, plus when that line was emitted.
+/// The hint path runs on every handshake, so it logs at most one summary per
+/// [`SUMMARY_MS`] instead of one line per hint.
+static OUTCOMES: Mutex<Option<(u64, [(u64, &str); 10])>> = Mutex::new(None);
+const SUMMARY_MS: u64 = 10_000;
+
+/// Record what a hint did. `Started` is logged at once (it is rare and it is
+/// the outcome the feature exists for); everything else is counted and emitted
+/// by the rate-limited summary.
+pub(crate) fn record(host: &str, outcome: &str) {
+    let now = hive_core::now_ms();
+    let emit = {
+        let mut slot = match OUTCOMES.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        let (since, counts) = slot.get_or_insert((now, [(0, "started"); 10]));
+        *counts = [
+            (counts[0].0, "started"),
+            (counts[1].0, "already-warm"),
+            (counts[2].0, "refused"),
+            (counts[3].0, "failed"),
+            (counts[4].0, "not-served"),
+            (counts[5].0, "not-ready"),
+            (counts[6].0, "static"),
+            (counts[7].0, "ambiguous"),
+            (counts[8].0, "forwarded"),
+            (counts[9].0, "forward-failed"),
+        ];
+        if let Some(c) = counts.iter_mut().find(|(_, n)| *n == outcome) {
+            c.0 += 1;
+        }
+        if now.saturating_sub(*since) >= SUMMARY_MS {
+            let line = counts
+                .iter()
+                .filter(|(n, _)| *n > 0)
+                .map(|(n, name)| format!("{name}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            *since = now;
+            *counts = [(0, "started"); 10];
+            Some(line)
+        } else {
+            None
+        }
+    };
+    if outcome == "started" {
+        tracing::info!(host = %host, "prewarm: started an instance ahead of the request");
+    }
+    if let Some(line) = emit {
+        tracing::info!(
+            hints = HINTS.load(Ordering::Relaxed),
+            dropped = DROPPED.load(Ordering::Relaxed),
+            dupes = DUPES.load(Ordering::Relaxed),
+            forwarded = FORWARDED.load(Ordering::Relaxed),
+            "prewarm: outcomes {line}"
+        );
+    }
+}
+
 /// Last hint time per host, for dedupe.
 static LAST: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
@@ -108,9 +168,24 @@ pub fn hint(host: &str) {
     }
 }
 
+/// `HIVE_PREWARM=0` (or `false`) disables prewarming entirely.
+fn enabled() -> bool {
+    std::env::var("HIVE_PREWARM")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
+}
+
 /// Install the SNI hook and start the worker. Called once at boot, after the
 /// gateway exists.
 pub fn spawn(cloud: Arc<CloudState>) {
+    if !enabled() {
+        // Kill switch: `HIVE_PREWARM=0` leaves the SNI hook uninstalled, so the
+        // old behavior is one env var away on a single node (an A/B measurement,
+        // or a quick retreat if a hint ever costs more than it saves).
+        tracing::info!("prewarm: disabled by HIVE_PREWARM=0");
+        return;
+    }
     let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_MAX);
     if TX.set(tx).is_err() {
         return;
@@ -140,14 +215,8 @@ async fn worker(cloud: Arc<CloudState>, mut rx: tokio::sync::mpsc::Receiver<Stri
 
 async fn handle(cloud: &Arc<CloudState>, host: &str) {
     if cloud.gw.serves_host(host) {
-        match cloud.gw.warm_host(host).await {
-            fluid_gateway::WarmHost::Started => {
-                tracing::info!(host = %host, "prewarm: started an instance ahead of the request");
-            }
-            other => {
-                tracing::debug!(host = %host, outcome = ?other, "prewarm: no start needed");
-            }
-        }
+        let outcome = cloud.gw.warm_host(host).await;
+        record(host, outcome.as_str());
         return;
     }
     // Not ours: forward to a healthy peer that does serve it. Same owner
@@ -184,7 +253,7 @@ async fn handle(cloud: &Arc<CloudState>, host: &str) {
     FORWARDED.fetch_add(1, Ordering::Relaxed);
     // Fire and forget: a hint is an optimization, never a dependency, and the
     // owner applies its own gates on arrival.
-    let _ = crate::gossip::request_to(
+    let sent = crate::gossip::request_to(
         cloud,
         &node_id,
         &addr,
@@ -193,7 +262,12 @@ async fn handle(cloud: &Arc<CloudState>, host: &str) {
         body.as_bytes(),
         3,
     )
-    .await;
+    .await
+    .is_some();
+    // A forward is the common case (most deployments live on one node while
+    // public DNS spreads handshakes across the fleet), so it is recorded like
+    // any other outcome — a silent majority path would be unobservable.
+    record(host, if sent { "forwarded" } else { "forward-failed" });
 }
 
 /// Handle a hint that arrived over the mesh (see the `/v1/warm-hint` gossip
@@ -205,13 +279,7 @@ pub fn handle_remote(cloud: Arc<CloudState>, host: String) {
         return;
     }
     crate::bulkhead::spawn(async move {
-        match cloud.gw.warm_host(&host).await {
-            fluid_gateway::WarmHost::Started => {
-                tracing::info!(host = %host, "prewarm: started an instance from a mesh hint");
-            }
-            other => {
-                tracing::debug!(host = %host, outcome = ?other, "prewarm: mesh hint needed no start");
-            }
-        }
+        let outcome = cloud.gw.warm_host(&host).await;
+        record(&host, outcome.as_str());
     });
 }
