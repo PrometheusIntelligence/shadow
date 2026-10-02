@@ -82,16 +82,38 @@ fn certs() -> &'static ArcSwap<HashMap<String, Arc<CertifiedKey>>> {
 #[derive(Debug)]
 pub struct SniResolver;
 
+/// Hook fired with the SNI of every handshake this node can serve — the
+/// earliest point at which a request's destination is knowable. Never awaited:
+/// it only pushes onto the prewarm queue (see `crate::prewarm`).
+static WARM_HOOK: std::sync::OnceLock<std::sync::Arc<dyn Fn(&str) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Install the ClientHello-time prewarm hook. Called once at boot.
+pub fn install_warm_hook(f: std::sync::Arc<dyn Fn(&str) + Send + Sync>) {
+    let _ = WARM_HOOK.set(f);
+}
+
+fn fire_warm(name: &str) {
+    if let Some(h) = WARM_HOOK.get() {
+        h(name);
+    }
+}
+
 impl ResolvesServerCert for SniResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let name = hello.server_name()?.to_ascii_lowercase();
         let map = certs().load();
         if let Some(k) = map.get(&name) {
+            fire_warm(&name);
             return Some(k.clone()); // apex / exact host bundle key
         }
         // one label up → wildcard zone
         let (_, zone) = name.split_once('.')?;
-        map.get(zone).cloned()
+        let k = map.get(zone).cloned();
+        if k.is_some() {
+            fire_warm(&name);
+        }
+        k
     }
 }
 

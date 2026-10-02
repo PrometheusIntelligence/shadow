@@ -75,6 +75,7 @@ mod microfrontends;
 mod microfrontends_api;
 mod notifications;
 mod persist;
+mod prewarm;
 mod production_deployments;
 mod project_settings;
 mod push;
@@ -1908,6 +1909,11 @@ async fn async_main() -> anyhow::Result<()> {
     // peer (not just the ones we directly gossip), so cross-node requests reuse a
     // warm trunk instead of paying a cold dial/holepunch on the critical path.
     spawn_trunk_warmer(cloud.clone());
+
+    // Speculative prewarm: start the function a request is about to invoke
+    // during its TLS handshake (the SNI arrives before the request does).
+    // Installs the ClientHello hook and runs the hint worker on the bulkhead.
+    crate::prewarm::spawn(cloud.clone());
 
     // Live relay-set refresh (dynamic-hive-relay-urls-list): keeps the bound iroh
     // endpoint's relay map in sync with [own relay_url, every healthy peer's

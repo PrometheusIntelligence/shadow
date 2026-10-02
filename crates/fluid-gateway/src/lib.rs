@@ -679,6 +679,27 @@ impl Drop for StagedDeployment {
     }
 }
 
+    /// Outcome of one speculative warm for a host, for logging and metrics.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WarmHost {
+        /// A cold start ran and one instance is now up.
+        Started,
+        /// The pool already had an instance or a start in flight.
+        AlreadyWarm,
+        /// The pool exists but refused (circuit, backoff, saturation, shutdown).
+        Refused,
+        /// The cold start was admitted and failed.
+        Failed,
+        /// No alias for this host on this node.
+        NotServed,
+        /// Alias exists but the deployment is not `Ready`.
+        NotReady,
+        /// Static deployment — no function to warm.
+        NothingToWarm,
+        /// More than one function: the request's target is not knowable yet.
+        Ambiguous,
+    }
+
 impl Gateway {
     pub fn new(fluid: Arc<Fluid>, image: String) -> Arc<Gateway> {
         let runtime_artifact_store = std::env::var_os("HIVE_DATA")
@@ -1918,6 +1939,48 @@ impl Gateway {
                 };
                 self.fluid.set_min_instances(&key, n);
             }
+        }
+    }
+
+    /// Bring one instance of the function `host` will invoke up AHEAD of the
+    /// request. Returns immediately with what happened; never blocks a request
+    /// path for long and never creates a permanent instance (an unused one is
+    /// drained by the ordinary scale-to-zero rule).
+    ///
+    /// Refuses without side effects unless the deployment is `Ready` and the
+    /// function is unambiguous, so a prewarm can never resurrect a dead
+    /// placeholder or spend a cell on a host this node does not serve.
+    pub async fn warm_host(&self, host: &str) -> WarmHost {
+        if !self.serves_host(host) {
+            return WarmHost::NotServed;
+        }
+        if self.host_deploy_state(host) != Some(fluid_core::DeployState::Ready) {
+            return WarmHost::NotReady;
+        }
+        let Some(did) = self.host_deployment_id(host) else {
+            return WarmHost::NotServed;
+        };
+        let names: Vec<String> = {
+            let st = self.state.lock();
+            match st.deployments.get(&fluid_core::DeploymentId(did.clone())) {
+                Some(d) => d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
+                None => return WarmHost::NotReady,
+            }
+        };
+        match names.len() {
+            0 => return WarmHost::NothingToWarm,
+            1 => {}
+            // Multi-function: which one the request hits depends on the path,
+            // which a ClientHello does not carry. Warming all of them would
+            // spend N cells on a guess, so wait for the request.
+            _ => return WarmHost::Ambiguous,
+        }
+        let key = func_key(&did, &names[0]);
+        match self.fluid.warm(&key).await {
+            Ok(fluid_compute::WarmVerdict::Started) => WarmHost::Started,
+            Ok(fluid_compute::WarmVerdict::AlreadyWarm) => WarmHost::AlreadyWarm,
+            Ok(fluid_compute::WarmVerdict::Refused) => WarmHost::Refused,
+            Err(_) => WarmHost::Failed,
         }
     }
 

@@ -194,6 +194,19 @@ async fn dispatch_verified(
             }
             Vec::new()
         }
+        // A prewarm hint forwarded from an entry node that does NOT host the
+        // deployment (public hosts are round-robin DNS, so the handshake
+        // usually lands elsewhere). Served here only: never re-forwarded, and
+        // the local gates in `Gateway::warm_host`/`Fluid::warm` decide whether
+        // a start actually happens.
+        "/v1/warm-hint" if method == hive_p2p::GOSSIP_POST => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+                if let Some(host) = v.get("host").and_then(|h| h.as_str()) {
+                    crate::prewarm::handle_remote(cloud.clone(), host.to_string());
+                }
+            }
+            Vec::new()
+        }
         "/v1/nodes" => {
             match crate::admin::nodes(State(cloud.clone()), mesh_operator_claims()).await {
                 Ok(j) => jb(j),

@@ -663,6 +663,17 @@ fn norm_tenant(t: String) -> String {
     }
 }
 
+    /// Outcome of a speculative (request-less) warm attempt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WarmVerdict {
+        /// A cold start was admitted and completed; one instance is up.
+        Started,
+        /// Nothing to do: an instance already exists or a start is in flight.
+        AlreadyWarm,
+        /// Refused without side effects (no reservation taken).
+        Refused,
+    }
+
 impl Fluid {
     pub fn start(backend: Arc<dyn CellBackend>, cfg: FluidConfig) -> Arc<Fluid> {
         let cold_start_capacity = max_concurrent_cold_starts();
@@ -1535,6 +1546,94 @@ impl Fluid {
         Ok(LeaseDecision::ColdStart)
     }
 
+    /// Speculatively bring one instance of `key` up AHEAD of any request.
+    ///
+    /// This is the ONE entry point for warming: the autoscaler's keep-warm path
+    /// and any speculative caller (a prewarm hint) share it, so they share the
+    /// crash-loop circuit, the warm backoff and the provisioning reservation
+    /// semantics instead of re-deriving them — a second copy would silently
+    /// relaunch a start-then-die function forever, which is exactly the failure
+    /// the circuit exists to stop.
+    ///
+    /// Never duplicates work: refuses (taking no reservation) when the pool is
+    /// already warm, already starting, saturated, in backoff, behind an open
+    /// circuit, or shutting down. A speculative instance is drained by the
+    /// ordinary scale-to-zero rule once idle, so a wrong guess costs an idle
+    /// instance for `idle_ttl`, never a permanent one.
+    pub async fn warm(self: &Arc<Self>, key: &str) -> anyhow::Result<WarmVerdict> {
+        let now = now_ms();
+        {
+            let mut reg = self.registry.lock();
+            let Some(pool) = reg.get_mut(key) else {
+                return Ok(WarmVerdict::Refused);
+            };
+            if self.is_shutting_down() {
+                return Ok(WarmVerdict::Refused);
+            }
+            // The same three gates keep-warm respects — a hint must never spend
+            // a reservation behind them.
+            if pool.crash_streak >= CRASH_CIRCUIT_THRESHOLD {
+                return Ok(WarmVerdict::Refused);
+            }
+            if now < pool.warm_backoff_until_ms || now < pool.circuit_probe_after_ms {
+                return Ok(WarmVerdict::Refused);
+            }
+            if !pool.instances.iter().any(|i| !i.draining) && pool.provisioning == 0 {
+                // Genuinely cold: fall through and take the reservation.
+            } else {
+                return Ok(WarmVerdict::AlreadyWarm);
+            }
+            if pool.live_count() >= pool.cfg.max_instances {
+                return Ok(WarmVerdict::Refused);
+            }
+            pool.provisioning += 1;
+        }
+        match self.warm_instance(key).await {
+            Ok(()) => Ok(WarmVerdict::Started),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Run one cold start for an already-reserved pool and apply the shared
+    /// success/failure bookkeeping (inflight reset, backoff clear, node-fault
+    /// clear, `last_warm_ok_ms`). Used by keep-warm and by [`Self::warm`].
+    pub async fn warm_instance(self: &Arc<Self>, key: &str) -> anyhow::Result<()> {
+        match self.cold_start(key).await {
+            Ok((cell_id, _)) => {
+                // Warm instance: it was created with inflight=1; reset to 0.
+                if let Some(pool) = self.registry.lock().get_mut(key) {
+                    if let Some(inst) = pool.instances.iter_mut().find(|i| i.cell_id == cell_id) {
+                        inst.inflight = 0;
+                        inst.last_active_ms = now_ms();
+                    }
+                    // The backend accepted the launch — clear the hard-failure
+                    // backoff. `crash_streak` is deliberately NOT cleared here:
+                    // Ok only means it STARTED, and clearing it on start is
+                    // exactly what let a start-then-die container relaunch
+                    // forever. Reconcile clears it once the instance has
+                    // actually survived CRASH_LOOP_WINDOW_MS.
+                    pool.warm_fail_streak = 0;
+                    pool.warm_backoff_until_ms = 0;
+                    pool.circuit_probe_after_ms = 0;
+                    // A launch the backend accepted proves the node's
+                    // artifacts + hypervisor are usable again.
+                    pool.last_node_fault = None;
+                    pool.last_warm_ok_ms = now_ms();
+                }
+                debug!(func = %key, "warm instance ready");
+                Ok(())
+            }
+            Err(e) => {
+                // Reservation release, backoff (2s, 4s, 8s … capped ~64s)
+                // and the circuit gate are all armed by `cold_start`'s Drop
+                // guard, so a pool that keeps failing stops storming no
+                // matter which caller drove the attempt.
+                debug!(func = %key, error = %e, "keep-warm cold start failed");
+                Err(e)
+            }
+        }
+    }
+
     /// Provision a cell and start the function in it. `provisioning` was already
     /// incremented by the caller; on success we add the instance with inflight=1.
     /// Count EVERY failing cold start here, CANCELLATION-SAFELY — the one point
@@ -2115,40 +2214,7 @@ impl Fluid {
         let warm = futures::future::join_all(to_warm.into_iter().map(|key| {
             let f = self.clone();
             async move {
-                match f.cold_start(&key).await {
-                    Ok((cell_id, _)) => {
-                        // Warm instance: it was created with inflight=1; reset to 0.
-                        if let Some(pool) = f.registry.lock().get_mut(&key) {
-                            if let Some(inst) =
-                                pool.instances.iter_mut().find(|i| i.cell_id == cell_id)
-                            {
-                                inst.inflight = 0;
-                                inst.last_active_ms = now_ms();
-                            }
-                            // The backend accepted the launch — clear the hard-failure
-                            // backoff. `crash_streak` is deliberately NOT cleared here:
-                            // Ok only means it STARTED, and clearing it on start is
-                            // exactly what let a start-then-die container relaunch
-                            // forever. Reconcile clears it once the instance has
-                            // actually survived CRASH_LOOP_WINDOW_MS.
-                            pool.warm_fail_streak = 0;
-                            pool.warm_backoff_until_ms = 0;
-                            pool.circuit_probe_after_ms = 0;
-                            // A launch the backend accepted proves the node's
-                            // artifacts + hypervisor are usable again.
-                            pool.last_node_fault = None;
-                            pool.last_warm_ok_ms = now_ms();
-                        }
-                        debug!(func = %key, "warm instance ready");
-                    }
-                    Err(e) => {
-                        // Reservation release, backoff (2s, 4s, 8s … capped ~64s)
-                        // and the circuit gate are all armed by `cold_start`'s Drop
-                        // guard, so a pool that keeps failing stops storming no
-                        // matter which caller drove the attempt.
-                        debug!(func = %key, error = %e, "keep-warm cold start failed");
-                    }
-                }
+                let _ = f.warm_instance(&key).await;
             }
         }));
         let drain = futures::future::join_all(to_drain.into_iter().map(
