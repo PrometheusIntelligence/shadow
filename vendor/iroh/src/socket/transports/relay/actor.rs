@@ -1,3 +1,4 @@
+// Modified from upstream iroh 1.0.2 (n0-computer/iroh, MIT OR Apache-2.0); see vendor/iroh/CHANGES.md.
 //! The relay actor.
 //!
 //! The [`RelayActor`] handles all the relay connections.  It is helped by the

@@ -1,3 +1,4 @@
+// Modified from upstream iroh 1.0.2 (n0-computer/iroh, MIT OR Apache-2.0); see vendor/iroh/CHANGES.md.
 //! Lookup the address of an Endpoint ID.
 //!
 //! To connect to an iroh endpoint a [`EndpointAddr`] is needed, which may contain a

@@ -24,3 +24,11 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## 6. Limitation of Liability
 IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE.
+
+## 7. Third-Party Components
+This Agreement covers only the Licensor's original work. Third-party components included in this
+repository (for example under `vendor/`, `ui/vendor/`, `ui/public/browser-node/node-worker/`, the
+`wa-sqlite` directories and the dependencies resolved through `Cargo.lock` and `package-lock.json`)
+are licensed under their own terms, which are listed in `THIRD-PARTY-NOTICES.md`. Nothing in
+Section 2 restricts any right you have under those licenses, and the license and notice files
+shipped with those components must be preserved in any copy or distribution.

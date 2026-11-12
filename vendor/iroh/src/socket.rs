@@ -1,3 +1,4 @@
+// Modified from upstream iroh 1.0.2 (n0-computer/iroh, MIT OR Apache-2.0); see vendor/iroh/CHANGES.md.
 //! Implements a socket that can change its communication path while in use, actively searching for the best way to communicate.
 //!
 //!

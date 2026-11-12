@@ -1,0 +1,5 @@
+The files in this directory are a build of vendor/node-worker, licensed under the
+GNU Affero General Public License v3.0 only (see LICENSE in this directory).
+
+Corresponding Source: vendor/node-worker in this repository (including its
+patches/ and node-patches/ directories), together with scripts/build-node-worker.sh, which builds these files.
