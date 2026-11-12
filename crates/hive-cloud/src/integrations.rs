@@ -10,6 +10,12 @@
 //!
 //! Secrets (`credentials`) are returned ONLY from the explicit credentials endpoint; the list and
 //! get views are redacted (env var names and masked values).
+//!
+//! At rest, every credential and env VALUE is sealed with the fleet at-rest key (`secrets::encrypt`,
+//! `enc:v1:`) at write time (`upsert`), so the persisted snapshot and the store_sync payload never
+//! carry a plaintext OAuth token. `load` deliberately does NOT re-seal: wholesale adoption compares
+//! peer payloads byte for byte, and a per-node random nonce would make identical state differ. A
+//! row written before sealing existed stays readable as-is and is sealed on its next re-link.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -67,12 +73,41 @@ impl IntegrationResource {
             "provider": self.provider,
             "name": self.name,
             "kind": self.kind,
-            "credentials": self.credentials,
-            "env": self.env,
+            "credentials": open_map(&self.credentials),
+            "env": open_map(&self.env),
             "created_ms": self.created_ms,
             "updated_ms": self.updated_ms,
         })
     }
+}
+
+/// Seal every value. `secrets::encrypt` fails OPEN (returns the plaintext on an RNG or seal fault),
+/// so the result is checked and a fault is logged rather than silently storing a readable token.
+fn seal_map(m: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    m.into_iter()
+        .map(|(k, v)| {
+            let sealed = crate::secrets::encrypt(&v);
+            if !v.is_empty() && !crate::secrets::is_encrypted(&sealed) {
+                tracing::warn!(key = %k, "integration credential could not be sealed at rest");
+            }
+            (k, sealed)
+        })
+        .collect()
+}
+
+/// Open sealed values for the credentials endpoint. A legacy plaintext value passes through; a
+/// sealed value no configured key can open is withheld (empty) rather than handed out as ciphertext.
+fn open_map(m: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    m.iter()
+        .map(|(k, v)| {
+            let opened = if crate::secrets::is_encrypted(v) {
+                crate::secrets::try_decrypt(v).unwrap_or_default()
+            } else {
+                v.clone()
+            };
+            (k.clone(), opened)
+        })
+        .collect()
 }
 
 /// Upsert payload from the dashboard's link callback.
@@ -135,8 +170,8 @@ impl IntegrationStore {
             existing.name = name;
             existing.kind = kind;
             existing.entity = req.entity;
-            existing.credentials = req.credentials;
-            existing.env = req.env;
+            existing.credentials = seal_map(req.credentials);
+            existing.env = seal_map(req.env);
             existing.updated_ms = now_ms();
             return existing.clone();
         }
@@ -147,8 +182,8 @@ impl IntegrationStore {
             name,
             kind,
             entity: req.entity,
-            credentials: req.credentials,
-            env: req.env,
+            credentials: seal_map(req.credentials),
+            env: seal_map(req.env),
             created_ms: now_ms(),
             updated_ms: now_ms(),
         };
