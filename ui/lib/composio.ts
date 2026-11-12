@@ -8,17 +8,27 @@ import { verifiedUserId } from "./session-identity";
 const BASE = "https://backend.composio.dev/api/v3";
 export const GITHUB_SLUG = "github";
 
+const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
+
 export function composioConfigured(): boolean {
   return !!process.env.COMPOSIO_API_KEY;
 }
 
-/** The Composio entity for this request: `gh_<verifiedUserId>` when signed in, else the `hive_entity` cookie, else `default`.
+/** The Composio entity for this request: `gh_<verifiedUserId>` when signed in; with Clerk enabled
+ *  and no verified session, a fresh unguessable `anon_*` entity that owns no connection; only in
+ *  local no-auth mode, the `hive_entity` cookie, else `default`.
  *  It must resolve the SAME identity as the GitHub App credential binding and `/api/token`: bare
  *  `auth()` reports signed-out on iOS Safari / standalone PWAs while the Clerk session is valid,
- *  which made a connected account look up a different entity on a phone. */
+ *  which made a connected account look up a different entity on a phone.
+ *
+ *  SECURITY: the `hive_entity` cookie is client-controlled and `/api(.*)` is public in the Clerk
+ *  middleware, so honouring it with Clerk on let an unauthenticated caller set
+ *  `hive_entity=gh_<victimUserId>` and act on the victim's GitHub/Composio connection (list
+ *  private repos, create repos, disconnect, start a connect on the victim's entity). */
 export async function resolveEntity(): Promise<string> {
   const uid = await verifiedUserId();
   if (uid) return `gh_${uid}`;
+  if (clerkEnabled) return `anon_${randomBytes(16).toString("hex")}`;
   try {
     const cookieEntity = (await cookies()).get("hive_entity")?.value;
     return cookieEntity || "default";
