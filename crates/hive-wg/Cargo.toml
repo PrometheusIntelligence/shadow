@@ -2,7 +2,7 @@
 name = "hive-wg"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 # Secure compute networking: ephemeral userspace WireGuard-style tunnels plus a
 # Key Exchange Service that mints short-lived peer credentials — the pattern

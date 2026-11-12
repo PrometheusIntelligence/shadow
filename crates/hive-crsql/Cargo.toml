@@ -2,7 +2,7 @@
 name = "hive-crsql"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "rusqlite wrapper for the vendored superfly/cr-sqlite loadable extension (vendor/cr-sqlite) -- CRR (conflict-free replicated relation) tables for the fleet-side + browser-side CRDT sync peers. See vendor/cr-sqlite/VENDOR.md."
 
 [dependencies]

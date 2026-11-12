@@ -2,7 +2,7 @@
 name = "hive-contract"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Contract + execution-transparency layer for managed database operations"

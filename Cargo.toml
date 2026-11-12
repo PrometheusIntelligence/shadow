@@ -40,8 +40,8 @@ exclude = ["vendor/guardian-db", "crates/hive-browser", "vendor/cr-sqlite"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-authors = ["Hive-rs reverse-engineering study"]
+license-file = "LICENSE.md"
+authors = ["Shadow maintainers"]
 repository = "local"
 
 [workspace.dependencies]

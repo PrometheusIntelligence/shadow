@@ -1,7 +1,10 @@
 /**
- * @openedge/vercel-sdk — a fork of the upstream `@vercel/sdk`, repointed at the
- * OpenEdge platform API and authenticated with an OpenEdge platform key
- * (`hive_…`) instead of a Vercel access token.
+ * @openedge/vercel-sdk — an independent OpenEdge platform client whose
+ * constructor shape mirrors the upstream `@vercel/sdk` (`{ serverURL,
+ * bearerToken }`). It contains no `@vercel/sdk` source code; it targets the
+ * OpenEdge platform API and authenticates with an OpenEdge platform key
+ * (`hive_…`) instead of a Vercel access token. Not affiliated with or
+ * endorsed by Vercel Inc.
  *
  * The public ergonomics mirror `@vercel/sdk`: construct a `Vercel` client with
  * `{ serverURL, bearerToken }` and call namespaced sub-APIs. The key change from
@@ -179,7 +182,7 @@ function mapIntegration(r: any): Integration {
 }
 
 /**
- * The OpenEdge-flavored Vercel SDK client. Drop-in shape with `@vercel/sdk`:
+ * The OpenEdge platform client. Constructor shape matches `@vercel/sdk`:
  *
  * ```ts
  * import { Vercel } from "@openedge/vercel-sdk";

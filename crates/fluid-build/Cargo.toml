@@ -2,7 +2,7 @@
 name = "fluid-build"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 # Framework-Defined Infrastructure: detect a project's framework, run its build,
 # and normalize the result into the Build Output API v3 — the standard contract

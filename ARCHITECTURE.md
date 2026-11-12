@@ -1,6 +1,6 @@
-# Hive-rs — reverse-engineering Vercel's builds infrastructure
+# Hive-rs — an independent implementation of the publicly described Hive builds architecture
 
-A study reimplementation, in Rust, of the architecture described in
+An independent Rust implementation of the architecture Vercel described publicly in
 [*A deep dive into Hive, Vercel's builds infrastructure*](https://vercel.com/blog/a-deep-dive-into-hive-vercels-builds-infrastructure).
 
 The goal is faithfulness to the **design**, not the proprietary code: the same

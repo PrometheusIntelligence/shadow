@@ -2,7 +2,7 @@
 name = "hive-zkauth"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "EXPERIMENT: anonymous team/role membership proofs (linkable ring signatures over Ristretto255). Standalone — not wired into the platform yet."
 
 [dependencies]

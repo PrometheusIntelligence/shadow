@@ -1,7 +1,7 @@
 {
   "name": "@openedge/vercel-sdk",
   "version": "0.1.0",
-  "description": "Fork of @vercel/sdk repointed at the OpenEdge platform API and authenticated with OpenEdge platform keys (hive_). Adds an integrations namespace for Composio-linked integration resources.",
+  "description": "Independent OpenEdge platform client whose constructor shape mirrors @vercel/sdk ({ serverURL, bearerToken }). Authenticates with OpenEdge platform keys (hive_) and exposes Composio-linked integration resources. Contains no @vercel/sdk source code; not affiliated with or endorsed by Vercel Inc.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,7 +13,7 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src", "README.md"],
+  "files": ["dist", "src", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"

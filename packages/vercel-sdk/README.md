@@ -1,11 +1,21 @@
 # @openedge/vercel-sdk
 
-A **fork of the upstream [`@vercel/sdk`](https://github.com/vercel/sdk)**, modified to be
-configurable/pointable at the **OpenEdge platform API** and to authenticate with an
-**OpenEdge platform key (`hive_…`)** instead of a Vercel access token.
+An **independent client for the OpenEdge platform API** whose constructor and calling
+convention mirror the upstream [`@vercel/sdk`](https://github.com/vercel/sdk), so code
+written against that shape can be repointed at **your OpenEdge deployment** and
+authenticate with an **OpenEdge platform key (`hive_…`)** instead of a Vercel access token.
 
-It keeps the upstream ergonomics — construct a `Vercel` client with `{ serverURL, bearerToken }`
-and call namespaced sub-APIs — so code written against `@vercel/sdk` repoints with a one-line change:
+> **Provenance.** This package is an independent implementation of the public `@vercel/sdk`
+> constructor shape. It is **not** a copy or derivative of the upstream source: compared with
+> `@vercel/sdk@1.28.62` (Apache-2.0, 1,175 generated TypeScript files), only two trivial
+> lines coincide (`export class VercelError extends Error {` and its `this.name` assignment),
+> and it has zero runtime dependencies. It covers only the `integrations` namespace;
+> it is **not** a drop-in replacement for the full upstream API surface.
+> "Vercel" is a trademark of Vercel Inc., used here only to describe interface
+> compatibility; this package is not affiliated with or endorsed by Vercel Inc.
+
+It keeps the upstream constructor ergonomics — construct a `Vercel` client with `{ serverURL, bearerToken }`
+and call namespaced sub-APIs — so code that only constructs the client repoints with a one-line change:
 
 ```diff
 - import { Vercel } from "@vercel/sdk";
@@ -20,7 +30,7 @@ and call namespaced sub-APIs — so code written against `@vercel/sdk` repoints 
 
 ## What's different from upstream
 
-| | upstream `@vercel/sdk` | this fork |
+| | upstream `@vercel/sdk` | this package |
 |---|---|---|
 | `serverURL` | `https://api.vercel.com` | **your OpenEdge API** (env `OPENEDGE_API_URL`, default `http://127.0.0.1:8786`) |
 | `bearerToken` | Vercel token | **`hive_…` platform key** (env `OPENEDGE_API_KEY`) — its team scopes every call |
